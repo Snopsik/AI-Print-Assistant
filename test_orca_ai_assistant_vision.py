@@ -109,6 +109,27 @@ class VisionPluginTests(unittest.TestCase):
             "https://host/v1/models",
         )
 
+    def test_normalize_chat_endpoint(self):
+        self.assertEqual(
+            plugin.normalize_chat_endpoint("https://api.dolphinllm.com/v1"),
+            "https://api.dolphinllm.com/v1/chat/completions",
+        )
+        self.assertEqual(
+            plugin.normalize_chat_endpoint("https://host/v1/chat/completions"),
+            "https://host/v1/chat/completions",
+        )
+        self.assertEqual(
+            plugin.normalize_chat_endpoint("https://host/v1?key=value"),
+            "https://host/v1/chat/completions?key=value",
+        )
+
+    def test_collect_context_without_app_language(self):
+        with mock.patch.object(
+            plugin.orca.host, "app_language", side_effect=AttributeError
+        ):
+            context = plugin.collect_context()
+        self.assertEqual(context["orca_ui_language"], "ru_RU")
+
     def test_provider_presets_and_custom_endpoint(self):
         self.assertEqual(plugin.provider_for_endpoint(plugin.PROVIDER_ENDPOINTS["openai"]), "openai")
         self.assertEqual(plugin.provider_for_endpoint(plugin.PROVIDER_ENDPOINTS["gemini"]), "gemini")
