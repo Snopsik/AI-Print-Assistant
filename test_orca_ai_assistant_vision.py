@@ -410,6 +410,33 @@ class VisionPluginTests(unittest.TestCase):
         }))
         self.assertTrue(parsed["confirmation_required"])
 
+    def test_safe_markdown_renderer_in_both_interfaces(self):
+        for page in (plugin.PAGE, plugin.DOCK_PAGE):
+            self.assertIn("function renderMarkdown(container,value)", page)
+            self.assertIn("function appendInline(parent,value)", page)
+            self.assertIn("function plainMath(value)", page)
+            self.assertIn("md-list-item", page)
+            self.assertNotIn("innerHTML", page)
+        self.assertNotIn("latest.textContent=data.text", plugin.DOCK_PAGE)
+        self.assertIn("showAnswer(data.text", plugin.DOCK_PAGE)
+
+    def test_full_width_layout_and_scrollable_dock(self):
+        self.assertIn(".msg{width:100%;max-width:none", plugin.PAGE)
+        self.assertIn("#changesList{display:grid", plugin.PAGE)
+        self.assertIn("max-width:110ch", plugin.PAGE)
+        self.assertIn("#dockScroll{flex:1;min-height:0;overflow:auto", plugin.DOCK_PAGE)
+        self.assertIn("html,body{height:100%;overflow:hidden}", plugin.DOCK_PAGE)
+        self.assertIn("<details><summary>Автоматическая проверка G-code</summary>", plugin.DOCK_PAGE)
+
+    def test_structured_prompts_and_readable_math(self):
+        self.assertIn("«### Наблюдения»", plugin.LOGIC_PROMPT)
+        self.assertIn("«### Что сделать»", plugin.LOGIC_PROMPT)
+        self.assertIn("«### Замечания»", plugin.GCODE_PROMPT)
+        self.assertIn("Не\nиспользуй LaTeX", plugin.LOGIC_PROMPT)
+        for page in (plugin.PAGE, plugin.DOCK_PAGE):
+            self.assertIn("replace(/\\\\times\\b/g,'×')", page)
+            self.assertIn("replace(/\\$/g,'')", page)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
