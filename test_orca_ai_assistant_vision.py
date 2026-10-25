@@ -16,6 +16,7 @@ IMAGE = "data:image/png;base64," + base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"0" 
 
 class PagesBase:
     def __init__(self):
+        self.base_initialized = True
         self._stored_config = "{}"
         self.outbox = []
         self.save_calls = 0
@@ -95,6 +96,8 @@ class VisionPluginTests(unittest.TestCase):
         package = plugin.AIPrintAssistantPlugin()
         package.register_capabilities()
         orca.register_capability.assert_called_with(plugin.AIAssistantPage)
+        page = plugin.AIAssistantPage()
+        self.assertTrue(page.base_initialized)
 
     def test_models_endpoint(self):
         self.assertEqual(
