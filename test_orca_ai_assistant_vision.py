@@ -437,6 +437,85 @@ class VisionPluginTests(unittest.TestCase):
             self.assertIn("replace(/\\\\times\\b/g,'×')", page)
             self.assertIn("replace(/\\$/g,'')", page)
 
+    def test_auto_apply_setting_is_saved_as_boolean(self):
+        page = plugin.AIAssistantPage()
+        PagesBase.__init__(page)
+        payload = config()
+        payload.update({"type": "save_settings", "auto_apply": True})
+        page.on_message(payload)
+        stored = json.loads(page._stored_config)
+        self.assertIs(stored["auto_apply"], True)
+        self.assertIs(page._public_config()["auto_apply"], True)
+
+    def test_text_recommendations_are_extracted_and_whitelisted(self):
+        payload = json.dumps({"setting_changes": [
+            {"category": "process", "key": "sparse_infill_speed", "value": 100},
+            {"category": "printer", "key": "printer_model", "value": "other"},
+        ]})
+        with mock.patch.object(plugin, "request_chat", return_value=payload) as request:
+            changes = plugin.extract_recommended_changes(
+                config(), {"answer": "Уменьшите скорость заполнения до 100 мм/с"},
+                {"print_settings": {"sparse_infill_speed": 180}},
+            )
+        self.assertEqual(changes[0]["value"], "100")
+        self.assertEqual(len(changes), 1)
+        self.assertIn("Уменьшите скорость", request.call_args.args[1][-1]["content"])
+
+    def test_apply_text_suggestions_and_restore_previous_value(self):
+        page = plugin.AIAssistantPage()
+        PagesBase.__init__(page)
+        page._last_analysis = {"answer": "Уменьшите sparse_infill_speed до 100"}
+        extracted = [{"category": "process", "key": "sparse_infill_speed", "value": "100"}]
+        with mock.patch.object(plugin, "collect_context", return_value={
+            "print_settings": {"sparse_infill_speed": 180},
+        }), mock.patch.object(plugin, "extract_recommended_changes", return_value=extracted), \
+                mock.patch.object(plugin, "apply_setting_changes", return_value=["process profile"]) as apply:
+            page._run_apply_suggestions(0)
+            self.assertEqual(apply.call_args.args[0][0]["old"], 180)
+            self.assertEqual(page._rollback_changes[0]["value"], "180")
+            page._run_rollback_changes(page._rollback_changes)
+        self.assertEqual(apply.call_args_list[1].args[0][0]["value"], "180")
+        self.assertEqual(page._rollback_changes, [])
+        self.assertTrue(page.outbox[-1]["success"])
+
+    def test_auto_apply_runs_after_structured_analysis(self):
+        page = plugin.AIAssistantPage()
+        PagesBase.__init__(page)
+        analysis = plugin.normalize_result(json.dumps({
+            "answer": "Снижаю скорость",
+            "setting_changes": [{"category": "process", "key": "sparse_infill_speed", "value": 100}],
+        }))
+        automatic_config = config()
+        automatic_config["auto_apply"] = True
+        with mock.patch.object(plugin, "run_analysis", return_value=analysis), \
+                mock.patch.object(plugin, "apply_setting_changes", return_value=["process profile"]):
+            page._run_request(automatic_config, "Оптимизируй", {
+                "print_settings": {"sparse_infill_speed": 180},
+            }, [], "", 0)
+        applied = next(item for item in page.outbox if item.get("type") == "apply_result")
+        self.assertTrue(applied["success"])
+        self.assertTrue(applied["automatic"])
+        self.assertTrue(applied["can_rollback"])
+
+    def test_failed_apply_keeps_rollback_available(self):
+        page = plugin.AIAssistantPage()
+        PagesBase.__init__(page)
+        changes = [{"category": "process", "key": "layer_height", "value": "0.2", "old": 0.16}]
+        with mock.patch.object(plugin, "apply_setting_changes", side_effect=RuntimeError("commit failed")):
+            page._run_apply_changes(changes)
+        self.assertFalse(page.outbox[-1]["success"])
+        self.assertTrue(page.outbox[-1]["can_rollback"])
+        self.assertEqual(page._rollback_changes[0]["value"], "0.16")
+
+    def test_apply_and_rollback_controls_exist_in_both_interfaces(self):
+        for page in (plugin.PAGE, plugin.DOCK_PAGE):
+            self.assertIn("id=\"applySuggested\"", page)
+            self.assertIn("id=\"rollbackChanges\" hidden", page)
+            self.assertIn("type:'apply_suggestions'", page)
+            self.assertIn("type:'rollback_changes'", page)
+        self.assertIn("id=\"auto_apply\"", plugin.PAGE)
+        self.assertIn("payload.auto_apply=document.getElementById('auto_apply').checked", plugin.PAGE)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
