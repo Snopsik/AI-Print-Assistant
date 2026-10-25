@@ -516,6 +516,37 @@ class VisionPluginTests(unittest.TestCase):
         self.assertIn("id=\"auto_apply\"", plugin.PAGE)
         self.assertIn("payload.auto_apply=document.getElementById('auto_apply').checked", plugin.PAGE)
 
+    def test_printer_modifications_are_saved_and_added_to_context(self):
+        page = plugin.AIAssistantPage()
+        PagesBase.__init__(page)
+        mods = "Ender-3 V3 SE; сопло Unicorn от K1 Max"
+        payload = config()
+        payload.update({"type": "save_settings", "printer_mods": "  " + mods + "  "})
+        page.on_message(payload)
+        self.assertEqual(json.loads(page._stored_config)["printer_mods"], mods)
+        self.assertEqual(page._public_config()["printer_mods"], mods)
+        self.assertEqual(plugin.collect_context(mods)["printer_modifications"], mods)
+
+    def test_printer_modifications_reach_recommendations_and_gcode_review(self):
+        configured = config()
+        configured["printer_mods"] = "Ender-3 V3 SE; сопло Unicorn от K1 Max"
+        payload = json.dumps({"setting_changes": []})
+        with mock.patch.object(plugin, "request_chat", return_value=payload) as request:
+            plugin.extract_recommended_changes(configured, {"answer": "Проверьте расход"}, {})
+        self.assertIn("сопло Unicorn от K1 Max", request.call_args.args[1][-1]["content"])
+        with mock.patch.object(plugin, "request_chat", return_value=result()) as request:
+            plugin.run_gcode_review(configured, {"lines": 10})
+        self.assertIn("сопло Unicorn от K1 Max", request.call_args.args[1][-1]["content"])
+
+    def test_printer_modifications_ui_default_and_prompt_priority(self):
+        self.assertIn('textarea id="printer_mods"', plugin.PAGE)
+        self.assertIn("'printer_mods'", plugin.PAGE)
+        self.assertIn("имеет приоритет над названием пресета", plugin.LOGIC_PROMPT)
+        self.assertEqual(
+            plugin.DEFAULT_CONFIG["printer_mods"],
+            "Creality Ender-3 V3 SE; установлено сопло Unicorn от K1 Max (пользовательский апгрейд).",
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
