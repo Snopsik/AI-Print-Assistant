@@ -551,13 +551,80 @@ class VisionPluginTests(unittest.TestCase):
         self.assertIn('aria-labelledby="apiTab" hidden', plugin.PAGE)
         self.assertIn("function setSettingsTab(name)", plugin.PAGE)
         printer_panel = plugin.PAGE.split('id="printerSettings"', 1)[1].split('id="apiSettings"', 1)[0]
-        for field in ("printer_mods", "auto_apply", "monitor_url"):
+        for field in ("printer_mods", "auto_apply", "monitor_url", "klipper_url", "loadKlipper"):
             self.assertIn('id="' + field + '"', printer_panel)
+        self.assertIn("type:'klipper_refresh'", plugin.PAGE)
         api_panel = plugin.PAGE.split('id="apiSettings"', 1)[1]
         self.assertIn('id="textFields"', api_panel)
         self.assertIn('id="forget"', api_panel)
         self.assertIn('id="closeSettings" aria-label="Закрыть настройки"', plugin.PAGE)
         self.assertIn("getElementById('closeSettings').onclick=()=>dialog.close()", plugin.PAGE)
+
+    def test_klipper_fetch_filters_configuration_and_state(self):
+        class KlipperResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def geturl(self):
+                return "http://printer.local:7125/printer/objects/query"
+
+            def read(self, limit):
+                return json.dumps({"status": {
+                    "configfile": {"config": {
+                        "printer": {"max_velocity": "300", "max_accel": "2500"},
+                        "extruder": {"pressure_advance": "0.04", "heater_pin": "PE5",
+                                     "sensor_type": "Generic 3950"},
+                        "mcu": {"serial": "/dev/serial/by-id/private"},
+                    }},
+                    "gcode_move": {"speed_factor": 1.0, "extrude_factor": 0.98,
+                                   "position": [1, 2, 3, 4]},
+                    "toolhead": {"max_accel": 2500},
+                }}).encode()
+
+        with mock.patch.object(plugin.urllib.request, "urlopen", return_value=KlipperResponse()) as opened:
+            context = plugin.fetch_klipper_context("http://printer.local:7125/")
+        request = opened.call_args.args[0]
+        self.assertEqual(request.full_url, "http://printer.local:7125/printer/objects/query")
+        self.assertEqual(request.get_method(), "POST")
+        self.assertIn("configfile", json.loads(request.data.decode())["objects"])
+        self.assertEqual(context["config"]["extruder"]["pressure_advance"], "0.04")
+        self.assertNotIn("heater_pin", context["config"]["extruder"])
+        self.assertNotIn("mcu", context["config"])
+        self.assertEqual(context["state"]["gcode_move"]["extrude_factor"], 0.98)
+        self.assertNotIn("position", context["state"]["gcode_move"])
+        with self.assertRaises(ValueError):
+            plugin.validate_klipper_url("http://user:secret@printer.local:7125")
+        self.assertNotIn("/printer/gcode/script", PLUGIN_PATH.read_text(encoding="utf-8"))
+
+    def test_klipper_refresh_saves_url_and_public_summary(self):
+        page = plugin.AIAssistantPage()
+        PagesBase.__init__(page)
+        snapshot = {"config": {"extruder": {"pressure_advance": "0.04"}},
+                    "state": {"gcode_move": {"speed_factor": 1}}}
+        with mock.patch.object(plugin, "fetch_klipper_context", return_value=snapshot):
+            page._run_klipper_refresh("http://printer.local:7125/")
+        self.assertEqual(json.loads(page._stored_config)["klipper_url"],
+                         "http://printer.local:7125")
+        self.assertEqual(page._klipper_context, snapshot)
+        self.assertTrue(page._public_config()["klipper_loaded"])
+        self.assertIn("Klipper загружен", page._public_config()["klipper_summary"])
+        self.assertTrue(page.outbox[-1]["success"])
+
+    def test_klipper_context_reaches_recommendations_and_gcode_review(self):
+        snapshot = {"config": {"extruder": {"pressure_advance": "0.04"}},
+                    "state": {"gcode_move": {"speed_factor": 1}}}
+        context = plugin.collect_context("", snapshot)
+        self.assertEqual(context["klipper"], snapshot)
+        with mock.patch.object(plugin, "request_chat",
+                               return_value=json.dumps({"setting_changes": []})) as request:
+            plugin.extract_recommended_changes(config(), {"answer": "Проверьте PA"}, context)
+        self.assertIn("pressure_advance", request.call_args.args[1][-1]["content"])
+        with mock.patch.object(plugin, "request_chat", return_value=result()) as request:
+            plugin.run_gcode_review(config(), {"lines": 10}, None, snapshot)
+        self.assertIn("pressure_advance", request.call_args.args[1][-1]["content"])
 
 
 if __name__ == "__main__":
