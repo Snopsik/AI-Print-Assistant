@@ -6,7 +6,7 @@
 # name = "AI Print Assistant"
 # description = "Cloud text and vision assistant with model discovery, collaborative image verification, print-risk guidance, and explicit user confirmation. Never controls the printer directly."
 # author = "Kimi"
-# version = "2.0.0"
+# version = "2.1.0"
 # ///
 
 import base64
@@ -20,15 +20,32 @@ import urllib.request
 import orca
 
 
+PROVIDER_ENDPOINTS = {
+    "openai": "https://api.openai.com/v1/chat/completions",
+    "gemini": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+    "glm": "https://api.z.ai/api/paas/v4/chat/completions",
+    "openrouter": "https://openrouter.ai/api/v1/chat/completions",
+}
+
 DEFAULT_CONFIG = {
     "mode": "unified",
-    "text_endpoint": "https://api.openai.com/v1/chat/completions",
+    "text_provider": "openai",
+    "text_endpoint": PROVIDER_ENDPOINTS["openai"],
     "text_model": "gpt-4.1-mini",
     "text_api_key": "",
-    "vision_endpoint": "https://api.openai.com/v1/chat/completions",
+    "vision_provider": "openai",
+    "vision_endpoint": PROVIDER_ENDPOINTS["openai"],
     "vision_model": "gpt-4.1-mini",
     "vision_api_key": "",
 }
+
+
+def provider_for_endpoint(endpoint):
+    normalized = str(endpoint).strip().rstrip("/")
+    for provider, known in PROVIDER_ENDPOINTS.items():
+        if normalized == known:
+            return provider
+    return "custom"
 
 SETTING_KEYS = (
     "printer_model", "nozzle_diameter", "layer_height", "first_layer_height",
@@ -508,13 +525,14 @@ PAGE = r'''<!doctype html>
 <div id="chat"><div class="welcome" id="welcome"><h2>Инженерный помощник с анализом фото</h2><div>Прикрепите фотографию печати или скриншот камеры. В раздельном режиме зрение описывает кадр, текстовая модель проверяет вывод и может запросить одну уточняющую верификацию.</div><div class="quick"><button data-q="Проанализируй текущую модель и настройки перед печатью.">Анализ модели</button><button data-q="Проверь изображение: есть ли отлипание, провисшие мосты, сдвиг слоёв или другой дефект? Насколько это срочно?">Проверить печать</button><button data-q="Как ускорить печать без критичной потери качества?">Ускорить печать</button></div></div></div>
 <div id="composer"><div id="attachmentPreview"></div><div class="inputrow"><button class="iconbtn" id="attach" title="Фото или скриншот">Фото</button><input id="file" type="file" accept="image/jpeg,image/png,image/webp" hidden><textarea id="input" rows="2" maxlength="4000" placeholder="Опишите проблему или прикрепите фото…"></textarea><button id="send">Отправить</button></div><div class="options"><label><input type="checkbox" id="useContext" checked> учитывать модель и профили</label><span id="busy">Готов</span></div></div></div>
 <dialog id="settingsDialog"><div class="form"><h2>Модели и подключения</h2><label>Режим<select id="mode"><option value="unified">Одна модель для текста и зрения</option><option value="separate">Раздельно: текстовая логика + зрение</option></select></label>
-<fieldset id="textFields"><legend>Текстовая / универсальная модель</legend><label>Endpoint<input id="text_endpoint" spellcheck="false"></label><label>Модель</label><div class="grid2"><input id="text_model" list="text_model_list" spellcheck="false"><button class="iconbtn" id="discover_text">Найти модели</button></div><datalist id="text_model_list"></datalist><label>API-ключ<input id="text_api_key" type="password" autocomplete="off" placeholder="Пусто — сохранить прежний"></label><div class="hint" id="text_key_state"></div><label class="hint"><input type="checkbox" id="visionOnlyText" style="width:auto;display:inline"> показать только модели с определённым зрением</label><div class="models" id="text_models">Нажмите «Найти модели» после сохранения ключа.</div></fieldset>
-<fieldset id="visionFields"><legend>Зрительная модель</legend><label>Endpoint<input id="vision_endpoint" spellcheck="false"></label><label>Модель</label><div class="grid2"><input id="vision_model" list="vision_model_list" spellcheck="false"><button class="iconbtn" id="discover_vision">Найти модели</button></div><datalist id="vision_model_list"></datalist><label>API-ключ<input id="vision_api_key" type="password" autocomplete="off" placeholder="Пусто — сохранить прежний"></label><div class="hint" id="vision_key_state"></div><label class="hint"><input type="checkbox" id="visionOnlyVision" style="width:auto;display:inline"> показать только модели с определённым зрением</label><div class="models" id="vision_models">Список не загружен.</div></fieldset>
+<fieldset id="textFields"><legend>Текстовая / универсальная модель</legend><label>Провайдер<select id="text_provider"><option value="openai">OpenAI</option><option value="gemini">Google Gemini</option><option value="glm">GLM / Z.AI</option><option value="openrouter">OpenRouter</option><option value="custom">Свой endpoint</option></select></label><div id="text_custom_endpoint" hidden><label>Ссылка своего endpoint<input id="text_endpoint" spellcheck="false" placeholder="https://example.com/v1/chat/completions"></label></div><label>Модель</label><div class="grid2"><input id="text_model" list="text_model_list" spellcheck="false"><button class="iconbtn" id="discover_text">Найти модели</button></div><datalist id="text_model_list"></datalist><label>API-ключ<input id="text_api_key" type="password" autocomplete="off" placeholder="Пусто — сохранить прежний"></label><div class="hint" id="text_key_state"></div><label class="hint"><input type="checkbox" id="visionOnlyText" style="width:auto;display:inline"> показать только модели с определённым зрением</label><div class="models" id="text_models">Нажмите «Найти модели» после сохранения ключа.</div></fieldset>
+<fieldset id="visionFields"><legend>Зрительная модель</legend><label>Провайдер<select id="vision_provider"><option value="openai">OpenAI</option><option value="gemini">Google Gemini</option><option value="glm">GLM / Z.AI</option><option value="openrouter">OpenRouter</option><option value="custom">Свой endpoint</option></select></label><div id="vision_custom_endpoint" hidden><label>Ссылка своего endpoint<input id="vision_endpoint" spellcheck="false" placeholder="https://example.com/v1/chat/completions"></label></div><label>Модель</label><div class="grid2"><input id="vision_model" list="vision_model_list" spellcheck="false"><button class="iconbtn" id="discover_vision">Найти модели</button></div><datalist id="vision_model_list"></datalist><label>API-ключ<input id="vision_api_key" type="password" autocomplete="off" placeholder="Пусто — сохранить прежний"></label><div class="hint" id="vision_key_state"></div><label class="hint"><input type="checkbox" id="visionOnlyVision" style="width:auto;display:inline"> показать только модели с определённым зрением</label><div class="models" id="vision_models">Список не загружен.</div></fieldset>
 <div class="hint">Формат API: OpenAI-совместимый <b>/chat/completions</b>; список запрашивается через <b>/models</b>. Пометки зрения берутся из метаданных провайдера или известных названий и не гарантируют поддержку. Можно ввести модель вручную. Ключи хранятся локально без шифрования.</div><div id="status"></div><div class="formactions"><button class="iconbtn" id="forget">Удалить все ключи</button><button class="primary" id="save">Сохранить</button></div></div></dialog>
 <script>
 const chat=document.getElementById('chat'),input=document.getElementById('input'),send=document.getElementById('send'),busy=document.getElementById('busy'),dialog=document.getElementById('settingsDialog');
 let waiting=false,attachment='',savedConfig={},modelCache={text:[],vision:[]};
-const ids=['mode','text_endpoint','text_model','vision_endpoint','vision_model'];
+const PROVIDER_ENDPOINTS={openai:'https://api.openai.com/v1/chat/completions',gemini:'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions',glm:'https://api.z.ai/api/paas/v4/chat/completions',openrouter:'https://openrouter.ai/api/v1/chat/completions'};
+const ids=['mode','text_provider','text_endpoint','text_model','vision_provider','vision_endpoint','vision_model'];
 function scrollBottom(){chat.scrollTop=chat.scrollHeight}
 function addMessage(role,text,isError=false,image=''){document.getElementById('welcome')?.remove();const row=document.createElement('div');row.className='msg '+role;const bubble=document.createElement('div');bubble.className='bubble'+(isError?' error':'');const label=document.createElement('div');label.className='role';label.textContent=role==='user'?'Вы':'AI Print Assistant';const content=document.createElement('div');content.textContent=text;bubble.append(label,content);if(image){const img=document.createElement('img');img.className='thumb';img.src=image;bubble.appendChild(img)}row.appendChild(bubble);chat.appendChild(row);scrollBottom();return bubble}
 const actionNames={inspect:'Провести ручной осмотр',pause:'Поставить печать на паузу',stop:'Остановить печать'};
@@ -525,8 +543,10 @@ send.onclick=()=>ask(input.value);input.onkeydown=e=>{if(e.key==='Enter'&&!e.shi
 document.getElementById('clear').onclick=()=>{if(waiting)return;orca.postMessage({type:'clear'});chat.querySelectorAll('.msg').forEach(e=>e.remove())};
 function clearAttachment(){attachment='';document.getElementById('file').value='';document.getElementById('attachmentPreview').textContent=''}
 document.getElementById('attach').onclick=()=>document.getElementById('file').click();document.getElementById('file').onchange=e=>{const file=e.target.files[0];if(!file)return;if(file.size>15*1024*1024){addMessage('assistant','Файл больше 15 МБ.',true);return}const reader=new FileReader();reader.onerror=()=>addMessage('assistant','Не удалось прочитать изображение.',true);reader.onload=()=>{const img=new Image();img.onerror=()=>addMessage('assistant','Формат изображения не поддерживается.',true);img.onload=()=>{const scale=Math.min(1,1600/Math.max(img.width,img.height));const canvas=document.createElement('canvas');canvas.width=Math.max(1,Math.round(img.width*scale));canvas.height=Math.max(1,Math.round(img.height*scale));canvas.getContext('2d').drawImage(img,0,0,canvas.width,canvas.height);attachment=canvas.toDataURL('image/jpeg',.86);document.getElementById('attachmentPreview').textContent='Изображение прикреплено: '+canvas.width+'×'+canvas.height+' (JPEG)' };img.src=reader.result};reader.readAsDataURL(file)};
-function fillForm(){ids.forEach(id=>document.getElementById(id).value=savedConfig[id]||'');document.getElementById('text_api_key').value='';document.getElementById('vision_api_key').value='';document.getElementById('text_key_state').textContent=savedConfig.has_text_key?'Ключ сохранён':'Ключ не сохранён';document.getElementById('vision_key_state').textContent=savedConfig.has_vision_key?'Ключ сохранён':'Ключ не сохранён';updateMode();document.getElementById('status').textContent=''}
+function updateProvider(kind){const provider=document.getElementById(kind+'_provider').value,custom=provider==='custom';document.getElementById(kind+'_custom_endpoint').hidden=!custom;if(!custom)document.getElementById(kind+'_endpoint').value=PROVIDER_ENDPOINTS[provider]||''}
+function fillForm(){ids.forEach(id=>document.getElementById(id).value=savedConfig[id]||'');['text','vision'].forEach(updateProvider);document.getElementById('text_api_key').value='';document.getElementById('vision_api_key').value='';document.getElementById('text_key_state').textContent=savedConfig.has_text_key?'Ключ сохранён':'Ключ не сохранён';document.getElementById('vision_key_state').textContent=savedConfig.has_vision_key?'Ключ сохранён':'Ключ не сохранён';updateMode();document.getElementById('status').textContent=''}
 function updateMode(){document.getElementById('visionFields').disabled=document.getElementById('mode').value!=='separate'}
+['text','vision'].forEach(kind=>document.getElementById(kind+'_provider').onchange=()=>{updateProvider(kind);modelCache[kind]=[];renderModels(kind)});
 document.getElementById('mode').onchange=updateMode;document.getElementById('settings').onclick=()=>{fillForm();dialog.showModal()};
 document.getElementById('save').onclick=()=>{const payload={type:'save_settings'};ids.forEach(id=>payload[id]=document.getElementById(id).value.trim());payload.text_api_key=document.getElementById('text_api_key').value;payload.vision_api_key=document.getElementById('vision_api_key').value;orca.postMessage(payload);document.getElementById('status').textContent='Сохранение…'};
 document.getElementById('forget').onclick=()=>orca.postMessage({type:'forget_keys'});
@@ -576,14 +596,22 @@ class AIAssistantPage(orca.pages.PagesPluginCapabilityBase):
                 config["vision_api_key"] = stored["api_key"]
         if config.get("mode") not in ("unified", "separate"):
             config["mode"] = "unified"
+        for kind in ("text", "vision"):
+            provider_key = kind + "_provider"
+            if not isinstance(stored, dict) or provider_key not in stored:
+                config[provider_key] = provider_for_endpoint(config[kind + "_endpoint"])
+            if config[provider_key] not in (*PROVIDER_ENDPOINTS, "custom"):
+                config[provider_key] = "custom"
         return config
 
     def _public_config(self):
         config = self._config()
         return {
             "mode": config["mode"],
+            "text_provider": config["text_provider"],
             "text_endpoint": config["text_endpoint"],
             "text_model": config["text_model"],
+            "vision_provider": config["vision_provider"],
             "vision_endpoint": config["vision_endpoint"],
             "vision_model": config["vision_model"],
             "has_text_key": bool(str(config.get("text_api_key", "")).strip()),
@@ -608,11 +636,15 @@ class AIAssistantPage(orca.pages.PagesPluginCapabilityBase):
             return
         if kind == "save_settings":
             current = self._config()
-            for field in ("mode", "text_endpoint", "text_model", "vision_endpoint", "vision_model"):
+            for field in ("mode", "text_provider", "text_endpoint", "text_model",
+                          "vision_provider", "vision_endpoint", "vision_model"):
                 if field in data:
                     current[field] = str(data[field]).strip()
             if current["mode"] not in ("unified", "separate"):
                 current["mode"] = "unified"
+            for kind in ("text", "vision"):
+                if current[kind + "_provider"] not in (*PROVIDER_ENDPOINTS, "custom"):
+                    current[kind + "_provider"] = "custom"
             for key in ("text_api_key", "vision_api_key"):
                 value = str(data.get(key, "")).strip()
                 if value:
