@@ -6,7 +6,7 @@
 # name = "AI Print Assistant"
 # description = "Cloud AI co-pilot with confirmed profile edits, G-code review, camera monitoring, and an interactive Prepare/Preview panel. Never controls the printer directly."
 # author = "Kimi"
-# version = "2.2.1"
+# version = "2.3.0"
 # ///
 
 import base64
@@ -42,6 +42,7 @@ DEFAULT_CONFIG = {
     "monitor_url": "",
     "monitor_interval": 60,
     "monitor_enabled": False,
+    "auto_apply": False,
 }
 
 
@@ -150,7 +151,8 @@ stop. Никогда не утверждай, что команда принте
 Если пользователь просит оптимизировать/изменить настройки, предложи до 8 реально полезных
 setting_changes, только с ключами из снимка print_settings. Не предлагай их для обычной диагностики
 фото. Не меняй printer_model. Значения должны быть консервативными и совместимыми с материалом,
-соплом и принтером. Изменения лишь предлагаются: применение происходит после отдельного подтверждения.
+соплом и принтером. Плагин проверяет изменения перед ручным применением; пользователь также
+может отдельно включить автоприменение с сохранением прежних значений для отката.
 '''
 
 VISION_PROMPT = r'''Ты — зрительный ассистент контроля FDM-печати. Отвечай на русском.
@@ -546,6 +548,27 @@ def apply_setting_changes(changes):
     return applied
 
 
+def extract_recommended_changes(config, analysis, context):
+    """Turn textual AI recommendations into the same whitelisted setting proposals."""
+    prompt = r'''Ты преобразуешь рекомендации FDM-печати в параметры OrcaSlicer. Отвечай на русском.
+Используй только изменения, которые явно предложены в тексте анализа и поддерживаются текущим
+снимком print_settings. Не выдумывай значения, не меняй printer_model. Категория должна точно
+соответствовать ключу. Верни ТОЛЬКО JSON:
+{"setting_changes":[{"category":"process|filament|printer","key":"точный ключ Orca",
+"value":"новое значение","reason":"краткое обоснование"}]}
+Если безопасно извлечь изменения нельзя, верни {"setting_changes":[]}.'''
+    packet = {
+        "analysis_answer": str(analysis.get("answer", ""))[:16000],
+        "print_settings": context.get("print_settings", {}),
+    }
+    raw = request_chat(service_for(config, "text"), [
+        {"role": "system", "content": prompt},
+        {"role": "user", "content": json.dumps(packet, ensure_ascii=False, separators=(",", ":"))},
+    ])
+    parsed = extract_json(raw) or {}
+    return normalize_setting_changes(parsed.get("setting_changes"))
+
+
 def normalize_result(raw):
     parsed = extract_json(raw) or {}
     answer = str(parsed.get("answer") or raw).strip()
@@ -785,13 +808,14 @@ body{overflow:hidden}.wrap{min-width:0}header{flex:none;flex-wrap:wrap;backgroun
 </style></head>
 <body><div class="wrap">
 <header><h1>AI Print Assistant <span class="sub">анализ · настройки · G-code · камера</span></h1><button class="iconbtn" id="openDock">Панель</button><button class="iconbtn" id="clear">Очистить</button><button class="iconbtn" id="settings">API и модели</button></header>
-<div class="workflow"><button id="optimize">Предложить настройки</button><button class="iconbtn" id="gcode">Проверить G-code</button><button class="iconbtn" id="monitor">Запустить мониторинг</button><input id="gcodeFile" type="file" accept=".gcode,.gco,.txt" hidden></div>
+<div class="workflow"><button id="optimize">Предложить настройки</button><button class="iconbtn" id="applySuggested">Применить рекомендации ИИ</button><button class="iconbtn" id="rollbackChanges" hidden>Откатить последнее применение</button><button class="iconbtn" id="gcode">Проверить G-code</button><button class="iconbtn" id="monitor">Запустить мониторинг</button><input id="gcodeFile" type="file" accept=".gcode,.gco,.txt" hidden></div>
 <section id="changes" hidden><div class="changeshead"><b>Предлагаемые изменения</b><button id="applyChanges">Подтвердить и применить</button></div><div id="changesList"></div><div class="hint">Ничего не меняется до подтверждения. После применения сохраните профиль и выполните нарезку заново.</div></section>
 <div id="chat"><div class="welcome" id="welcome"><h2>Инженерный помощник с анализом фото</h2><div>Прикрепите фотографию печати или скриншот камеры. В раздельном режиме зрение описывает кадр, текстовая модель проверяет вывод и может запросить одну уточняющую верификацию.</div><div class="quick"><button data-q="Проанализируй текущую модель и настройки перед печатью.">Анализ модели</button><button data-q="Проверь изображение: есть ли отлипание, провисшие мосты, сдвиг слоёв или другой дефект? Насколько это срочно?">Проверить печать</button><button data-q="Как ускорить печать без критичной потери качества?">Ускорить печать</button></div></div></div>
 <div id="composer"><div id="attachmentPreview"></div><div class="inputrow"><button class="iconbtn" id="attach" title="Фото или скриншот">Фото</button><input id="file" type="file" accept="image/jpeg,image/png,image/webp" hidden><textarea id="input" rows="2" maxlength="4000" placeholder="Опишите проблему или прикрепите фото…"></textarea><button id="send">Отправить</button></div><div class="options"><label><input type="checkbox" id="useContext" checked> учитывать модель и профили</label><span id="busy">Готов</span></div></div></div>
 <dialog id="settingsDialog"><div class="form"><h2>Модели и подключения</h2><label>Режим<select id="mode"><option value="unified">Одна модель для текста и зрения</option><option value="separate">Раздельно: текстовая логика + зрение</option></select></label>
 <fieldset id="textFields"><legend>Текстовая / универсальная модель</legend><label>Провайдер<select id="text_provider"><option value="openai">OpenAI</option><option value="gemini">Google Gemini</option><option value="glm">GLM / Z.AI</option><option value="openrouter">OpenRouter</option><option value="custom">Свой endpoint</option></select></label><div id="text_custom_endpoint" hidden><label>Ссылка своего endpoint<input id="text_endpoint" spellcheck="false" placeholder="https://example.com/v1/chat/completions"></label></div><label>Модель</label><div class="grid2"><input id="text_model" list="text_model_list" spellcheck="false"><button class="iconbtn" id="discover_text">Найти модели</button></div><datalist id="text_model_list"></datalist><label>API-ключ<input id="text_api_key" type="password" autocomplete="off" placeholder="Пусто — сохранить прежний"></label><div class="hint" id="text_key_state"></div><label class="hint"><input type="checkbox" id="visionOnlyText" style="width:auto;display:inline"> показать только модели с определённым зрением</label><div class="models" id="text_models">Нажмите «Найти модели» после сохранения ключа.</div></fieldset>
 <fieldset id="visionFields"><legend>Зрительная модель</legend><label>Провайдер<select id="vision_provider"><option value="openai">OpenAI</option><option value="gemini">Google Gemini</option><option value="glm">GLM / Z.AI</option><option value="openrouter">OpenRouter</option><option value="custom">Свой endpoint</option></select></label><div id="vision_custom_endpoint" hidden><label>Ссылка своего endpoint<input id="vision_endpoint" spellcheck="false" placeholder="https://example.com/v1/chat/completions"></label></div><label>Модель</label><div class="grid2"><input id="vision_model" list="vision_model_list" spellcheck="false"><button class="iconbtn" id="discover_vision">Найти модели</button></div><datalist id="vision_model_list"></datalist><label>API-ключ<input id="vision_api_key" type="password" autocomplete="off" placeholder="Пусто — сохранить прежний"></label><div class="hint" id="vision_key_state"></div><label class="hint"><input type="checkbox" id="visionOnlyVision" style="width:auto;display:inline"> показать только модели с определённым зрением</label><div class="models" id="vision_models">Список не загружен.</div></fieldset>
+<fieldset><legend>Применение рекомендаций</legend><label class="hint"><input type="checkbox" id="auto_apply" style="width:auto;display:inline"> автоматически применять проверенные настройки после анализа</label><div class="hint">Действует только на структурированные setting_changes, прошедшие проверку ключей и диапазонов. Прежние значения сохраняются для ручного отката. По умолчанию выключено.</div></fieldset>
 <fieldset><legend>Автоматический мониторинг камеры</legend><label>Прямой URL JPEG/PNG/WebP снимка<input id="monitor_url" spellcheck="false" placeholder="http://printer.local/webcam/?action=snapshot"></label><label>Интервал анализа, секунды (30–3600)<input id="monitor_interval" type="number" min="30" max="3600" step="1"></label><div class="hint">Каждый снимок отправляется выбранному облачному AI. Видеопотоки MJPEG не поддерживаются. Опасные действия требуют подтверждения и выполняются вручную.</div></fieldset>
 <div class="hint">Формат API: OpenAI-совместимый <b>/chat/completions</b>; список запрашивается через <b>/models</b>. Можно ввести базовый адрес, например <b>https://example.com/v1</b>, — <b>/chat/completions</b> добавится автоматически. Пометки зрения берутся из метаданных провайдера или известных названий и не гарантируют поддержку. Можно ввести модель вручную. Ключи хранятся локально без шифрования.</div><div id="status"></div><div class="formactions"><button class="iconbtn" id="forget">Удалить все ключи</button><button class="primary" id="save">Сохранить</button></div></div></dialog>
 <script>
@@ -808,11 +832,14 @@ const actionNames={inspect:'Провести ручной осмотр',pause:'�
 function addAction(data){if(!data.analysis||data.action_id==null||data.analysis.proposed_action==='none')return;const bubble=addMessage('assistant','');bubble.querySelector('.role').textContent='Требуется решение пользователя';const risk=document.createElement('span');risk.className='risk '+data.analysis.risk;risk.textContent=data.analysis.risk==='critical'?'Высокий риск':'Требуется внимание';const box=document.createElement('div');box.className='action';box.id='action-'+data.action_id;box.append(risk,document.createTextNode(' '+(actionNames[data.analysis.proposed_action]||'Проверить принтер')));const buttons=document.createElement('div');buttons.className='actionbuttons';const yes=document.createElement('button');yes.className='danger';yes.textContent='Подтверждаю';yes.onclick=()=>orca.postMessage({type:'action_confirm',action_id:data.action_id});const no=document.createElement('button');no.className='iconbtn';no.textContent='Отклонить';no.onclick=()=>orca.postMessage({type:'action_reject',action_id:data.action_id});buttons.append(yes,no);box.appendChild(buttons);bubble.appendChild(box)}
 function renderChanges(items){const section=document.getElementById('changes'),list=document.getElementById('changesList'),apply=document.getElementById('applyChanges');list.textContent='';section.hidden=!items||!items.length;apply.disabled=false;apply.textContent='Подтвердить и применить';(items||[]).forEach(item=>{const row=document.createElement('div'),head=document.createElement('div'),key=document.createElement('code'),category=document.createElement('span'),diff=document.createElement('div'),oldValue=document.createElement('div'),arrow=document.createElement('span'),newValue=document.createElement('div'),why=document.createElement('div');row.className='change';head.className='change-head';key.className='change-key';key.textContent=item.key;category.className='change-category';category.textContent=item.category;head.append(key,category);diff.className='diff';oldValue.className='diff-value old';oldValue.textContent=String(item.old??'—');oldValue.title='Текущее значение';arrow.className='diff-arrow';arrow.textContent='→';newValue.className='diff-value new';newValue.textContent=String(item.value);newValue.title='Новое значение';diff.append(oldValue,arrow,newValue);why.className='why';why.textContent=item.reason||'';row.append(head,diff,why);list.appendChild(row)})}
 function updateMonitor(){const b=document.getElementById('monitor'),on=!!savedConfig.monitor_enabled;b.textContent=on?'Остановить мониторинг':'Запустить мониторинг';b.classList.toggle('monitoron',on)}
+function updateRollback(available){document.getElementById('rollbackChanges').hidden=!available}
 function setWaiting(value){waiting=value;send.disabled=value;send.textContent=value?'Ждём…':'Отправить';if(!value)busy.textContent='Готов'}
 function ask(text){const question=String(text||'').trim();if(waiting||(!question&&!attachment))return;addMessage('user',question||'Проанализируй изображение.',false,attachment);input.value='';setWaiting(true);busy.textContent='Подготовка запроса…';orca.postMessage({type:'ask',text:question||'Проанализируй изображение на дефекты печати.',include_context:document.getElementById('useContext').checked,image:attachment});clearAttachment()}
 send.onclick=()=>ask(input.value);input.onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();ask(input.value)}};document.querySelectorAll('.quick button').forEach(b=>b.onclick=()=>ask(b.dataset.q));
 document.getElementById('optimize').onclick=()=>ask('Проанализируй модель, геометрию и активные профили. Предложи консервативные setting_changes для улучшения печати.');
 document.getElementById('applyChanges').onclick=()=>{if(confirm('Применить показанные изменения к активным профилям?'))orca.postMessage({type:'apply_changes'})};
+document.getElementById('applySuggested').onclick=()=>{if(confirm('Применить рекомендации последнего анализа? При необходимости ИИ сначала преобразует их в проверяемые настройки Orca.'))orca.postMessage({type:'apply_suggestions'})};
+document.getElementById('rollbackChanges').onclick=()=>{if(confirm('Восстановить значения, которые были до последнего применения ИИ?'))orca.postMessage({type:'rollback_changes'})};
 document.getElementById('openDock').onclick=()=>orca.postMessage({type:'dock_open'});
 document.getElementById('monitor').onclick=()=>orca.postMessage({type:savedConfig.monitor_enabled?'monitor_stop':'monitor_start'});
 document.getElementById('gcode').onclick=()=>document.getElementById('gcodeFile').click();
@@ -821,17 +848,17 @@ document.getElementById('clear').onclick=()=>{if(waiting)return;orca.postMessage
 function clearAttachment(){attachment='';document.getElementById('file').value='';document.getElementById('attachmentPreview').textContent=''}
 document.getElementById('attach').onclick=()=>document.getElementById('file').click();document.getElementById('file').onchange=e=>{const file=e.target.files[0];if(!file)return;if(file.size>15*1024*1024){addMessage('assistant','Файл больше 15 МБ.',true);return}const reader=new FileReader();reader.onerror=()=>addMessage('assistant','Не удалось прочитать изображение.',true);reader.onload=()=>{const img=new Image();img.onerror=()=>addMessage('assistant','Формат изображения не поддерживается.',true);img.onload=()=>{const scale=Math.min(1,1600/Math.max(img.width,img.height));const canvas=document.createElement('canvas');canvas.width=Math.max(1,Math.round(img.width*scale));canvas.height=Math.max(1,Math.round(img.height*scale));canvas.getContext('2d').drawImage(img,0,0,canvas.width,canvas.height);attachment=canvas.toDataURL('image/jpeg',.86);document.getElementById('attachmentPreview').textContent='Изображение прикреплено: '+canvas.width+'×'+canvas.height+' (JPEG)' };img.src=reader.result};reader.readAsDataURL(file)};
 function updateProvider(kind){const provider=document.getElementById(kind+'_provider').value,custom=provider==='custom';document.getElementById(kind+'_custom_endpoint').hidden=!custom;if(!custom)document.getElementById(kind+'_endpoint').value=PROVIDER_ENDPOINTS[provider]||''}
-function fillForm(){ids.forEach(id=>document.getElementById(id).value=savedConfig[id]??'');['text','vision'].forEach(updateProvider);document.getElementById('text_api_key').value='';document.getElementById('vision_api_key').value='';document.getElementById('text_key_state').textContent=savedConfig.has_text_key?'Ключ сохранён':'Ключ не сохранён';document.getElementById('vision_key_state').textContent=savedConfig.has_vision_key?'Ключ сохранён':'Ключ не сохранён';updateMode();updateMonitor();document.getElementById('status').textContent=''}
+function fillForm(){ids.forEach(id=>document.getElementById(id).value=savedConfig[id]??'');document.getElementById('auto_apply').checked=!!savedConfig.auto_apply;['text','vision'].forEach(updateProvider);document.getElementById('text_api_key').value='';document.getElementById('vision_api_key').value='';document.getElementById('text_key_state').textContent=savedConfig.has_text_key?'Ключ сохранён':'Ключ не сохранён';document.getElementById('vision_key_state').textContent=savedConfig.has_vision_key?'Ключ сохранён':'Ключ не сохранён';updateMode();updateMonitor();document.getElementById('status').textContent=''}
 function updateMode(){document.getElementById('visionFields').disabled=document.getElementById('mode').value!=='separate'}
 ['text','vision'].forEach(kind=>document.getElementById(kind+'_provider').onchange=()=>{updateProvider(kind);modelCache[kind]=[];renderModels(kind)});
 document.getElementById('mode').onchange=updateMode;document.getElementById('settings').onclick=()=>{fillForm();dialog.showModal()};
-document.getElementById('save').onclick=()=>{const payload={type:'save_settings'};ids.forEach(id=>payload[id]=document.getElementById(id).value.trim());payload.text_api_key=document.getElementById('text_api_key').value;payload.vision_api_key=document.getElementById('vision_api_key').value;orca.postMessage(payload);document.getElementById('status').textContent='Сохранение…'};
+document.getElementById('save').onclick=()=>{const payload={type:'save_settings'};ids.forEach(id=>payload[id]=document.getElementById(id).value.trim());payload.text_api_key=document.getElementById('text_api_key').value;payload.vision_api_key=document.getElementById('vision_api_key').value;payload.auto_apply=document.getElementById('auto_apply').checked;orca.postMessage(payload);document.getElementById('status').textContent='Сохранение…'};
 document.getElementById('forget').onclick=()=>orca.postMessage({type:'forget_keys'});
 function discover(kind){orca.postMessage({type:'discover',target:kind});document.getElementById('status').textContent='Получение списка моделей…'}
 document.getElementById('discover_text').onclick=()=>discover('text');document.getElementById('discover_vision').onclick=()=>discover('vision');
 function renderModels(kind){const items=modelCache[kind]||[],only=document.getElementById(kind==='text'?'visionOnlyText':'visionOnlyVision').checked,box=document.getElementById(kind+'_models'),list=document.getElementById(kind+'_model_list');box.textContent='';list.textContent='';items.filter(m=>!only||m.vision==='yes').forEach(m=>{const option=document.createElement('option');option.value=m.id;list.appendChild(option);const row=document.createElement('div');row.className='modelitem';const name=document.createElement('span');name.textContent=m.id;const tag=document.createElement('span');tag.className='tag';tag.textContent=m.vision==='yes'?'👁 зрение':m.vision==='no'?'без зрения':'зрение не указано';row.append(name,tag);row.onclick=()=>document.getElementById(kind+'_model').value=m.id;box.appendChild(row)});if(!box.children.length)box.textContent='Нет моделей по выбранному фильтру.'}
 ['Text','Vision'].forEach(s=>document.getElementById('visionOnly'+s).onchange=()=>renderModels(s.toLowerCase()));
-orca.onMessage(data=>{if(data.type==='state'){savedConfig=data.config||{};fillForm();if(data.changes)renderChanges(data.changes)}else if(data.type==='status'){busy.textContent=data.text}else if(data.type==='answer'){const bubble=addMessage('assistant',data.text);if(data.analysis&&data.analysis.risk!=='none'){const risk=document.createElement('span');risk.className='risk '+data.analysis.risk;risk.textContent=data.analysis.risk==='critical'?'Высокий риск':'Предупреждение';bubble.prepend(risk)}renderChanges(data.changes||[]);addAction(data);setWaiting(false)}else if(data.type==='gcode_result'||data.type==='monitor_answer'){addMessage('assistant',data.text,false,'',data.type==='gcode_result'?'G-code':'Камера');addAction(data);if(data.type==='gcode_result')setWaiting(false)}else if(data.type==='monitor_state'){savedConfig.monitor_enabled=data.enabled;updateMonitor();addMessage('assistant',data.text)}else if(data.type==='apply_result'){addMessage('assistant',data.text,!data.success);if(data.success){const b=document.getElementById('applyChanges');b.disabled=true;b.textContent='Изменения применены'}}else if(data.type==='error'){addMessage('assistant',data.text,true);setWaiting(false)}else if(data.type==='settings_saved'){document.getElementById('status').textContent='Сохранено';orca.postMessage({type:'ready'})}else if(data.type==='settings_error'){document.getElementById('status').textContent=data.text}else if(data.type==='models'){modelCache[data.target]=data.models;renderModels(data.target);document.getElementById('status').textContent='Найдено моделей: '+data.models.length}else if(data.type==='action_result'){const box=document.getElementById('action-'+data.action_id);if(box){box.querySelectorAll('button').forEach(b=>b.disabled=true);const note=document.createElement('div');note.className='hint';note.textContent=data.text;box.appendChild(note)}}});
+orca.onMessage(data=>{if(data.type==='state'){savedConfig=data.config||{};fillForm();updateRollback(!!data.can_rollback);renderChanges(data.changes||[])}else if(data.type==='status'){busy.textContent=data.text}else if(data.type==='answer'){const bubble=addMessage('assistant',data.text);if(data.analysis&&data.analysis.risk!=='none'){const risk=document.createElement('span');risk.className='risk '+data.analysis.risk;risk.textContent=data.analysis.risk==='critical'?'Высокий риск':'Предупреждение';bubble.prepend(risk)}renderChanges(data.changes||[]);addAction(data);setWaiting(false)}else if(data.type==='gcode_result'||data.type==='monitor_answer'){addMessage('assistant',data.text,false,'',data.type==='gcode_result'?'G-code':'Камера');addAction(data);if(data.type==='gcode_result')setWaiting(false)}else if(data.type==='monitor_state'){savedConfig.monitor_enabled=data.enabled;updateMonitor();addMessage('assistant',data.text)}else if(data.type==='apply_result'){addMessage('assistant',data.text,!data.success);updateRollback(!!data.can_rollback);if(data.success){renderChanges([]);const b=document.getElementById('applyChanges');b.disabled=true;b.textContent='Изменения применены'}}else if(data.type==='rollback_result'){addMessage('assistant',data.text,!data.success);updateRollback(!!data.can_rollback)}else if(data.type==='error'){addMessage('assistant',data.text,true);setWaiting(false)}else if(data.type==='settings_saved'){document.getElementById('status').textContent='Сохранено';orca.postMessage({type:'ready'})}else if(data.type==='settings_error'){document.getElementById('status').textContent=data.text}else if(data.type==='models'){modelCache[data.target]=data.models;renderModels(data.target);document.getElementById('status').textContent='Найдено моделей: '+data.models.length}else if(data.type==='action_result'){const box=document.getElementById('action-'+data.action_id);if(box){box.querySelectorAll('button').forEach(b=>b.disabled=true);const note=document.createElement('div');note.className='hint';note.textContent=data.text;box.appendChild(note)}}});
 orca.postMessage({type:'ready'});
 </script></body></html>'''
 
@@ -847,6 +874,7 @@ class AIAssistantPage(orca.pages.PagesPluginCapabilityBase):
         self._action_counter = 0
         self._pending_actions = {}
         self._proposed_changes = []
+        self._rollback_changes = []
         self._last_analysis = {}
         self._dock = None
         self._monitor_thread = None
@@ -919,6 +947,7 @@ class AIAssistantPage(orca.pages.PagesPluginCapabilityBase):
         except (ValueError, TypeError):
             config["monitor_interval"] = 60
         config["monitor_enabled"] = bool(config.get("monitor_enabled")) and bool(config.get("monitor_url"))
+        config["auto_apply"] = config.get("auto_apply") in (True, 1, "1", "true", "on")
         return config
 
     def _public_config(self):
@@ -936,6 +965,7 @@ class AIAssistantPage(orca.pages.PagesPluginCapabilityBase):
             "monitor_url": config["monitor_url"],
             "monitor_interval": config["monitor_interval"],
             "monitor_enabled": config["monitor_enabled"],
+            "auto_apply": config["auto_apply"],
         }
 
     def _post(self, data):
@@ -959,13 +989,16 @@ class AIAssistantPage(orca.pages.PagesPluginCapabilityBase):
         if kind in ("ready", "dock_ready"):
             with self._lock:
                 changes = list(self._proposed_changes)
-            self._post({"type": "state", "config": self._public_config(), "changes": changes})
+                can_rollback = bool(self._rollback_changes)
+            self._post({"type": "state", "config": self._public_config(), "changes": changes,
+                        "can_rollback": can_rollback})
             return
         if kind == "dock_open":
             self._open_dock()
             return
         if kind == "save_settings":
             current = self._config()
+            current["auto_apply"] = data.get("auto_apply") is True
             for field in ("mode", "text_provider", "text_endpoint", "text_model",
                           "vision_provider", "vision_endpoint", "vision_model", "monitor_url"):
                 if field in data:
@@ -1022,6 +1055,20 @@ class AIAssistantPage(orca.pages.PagesPluginCapabilityBase):
             config = self._config()
             service = service_for(config, target)
             self._start_thread(self._run_discovery, service, target)
+            return
+        if kind == "apply_suggestions":
+            with self._lock:
+                generation = self._generation
+            self._start_thread(self._run_apply_suggestions, generation)
+            return
+        if kind == "rollback_changes":
+            with self._lock:
+                rollback = list(self._rollback_changes)
+            if not rollback:
+                self._post({"type": "rollback_result", "success": False, "can_rollback": False,
+                            "text": "Нет сохранённых значений для отката."})
+                return
+            self._start_thread(self._run_rollback_changes, rollback)
             return
         if kind == "apply_changes":
             with self._lock:
@@ -1165,6 +1212,8 @@ class AIAssistantPage(orca.pages.PagesPluginCapabilityBase):
                 self._waiting = False
             self._post({"type": "answer", "text": result["answer"], "changes": changes,
                         "analysis": result, "action_id": action_id})
+            if changes and config.get("auto_apply"):
+                self._run_apply_changes(changes, automatic=True)
         except Exception as exc:
             with self._lock:
                 if generation == self._generation:
@@ -1179,20 +1228,95 @@ class AIAssistantPage(orca.pages.PagesPluginCapabilityBase):
         self._pending_actions[action_id] = result["proposed_action"]
         return action_id
 
-    def _run_apply_changes(self, changes):
-        self._post({"type": "status", "text": "Применение подтверждённых настроек…"})
+    def _run_apply_suggestions(self, generation):
+        with self._lock:
+            changes = list(self._proposed_changes)
+            analysis = dict(self._last_analysis)
+        if not changes and not analysis:
+            self._post({"type": "apply_result", "success": False,
+                        "text": "Сначала запустите анализ модели и получите рекомендации ИИ."})
+            return
         try:
-            targets = apply_setting_changes(changes)
+            if not changes:
+                self._post({"type": "status", "text": "Преобразование рекомендаций в настройки Orca…"})
+                context = collect_context()
+                extracted = extract_recommended_changes(self._config(), analysis, context)
+                settings = context.get("print_settings", {})
+                for change in extracted:
+                    change["old"] = settings.get(change["key"], "—")
+                changes = extracted
+                with self._lock:
+                    if generation != self._generation:
+                        return
+                    self._proposed_changes = list(changes)
+                    can_rollback = bool(self._rollback_changes)
+                self._post({"type": "state", "config": self._public_config(),
+                            "changes": changes, "can_rollback": can_rollback})
+            if not changes:
+                self._post({"type": "apply_result", "success": False,
+                            "text": "Не удалось безопасно извлечь параметры из рекомендаций. "
+                                    "Попросите ИИ указать точные ключи и значения Orca."})
+                return
+            self._run_apply_changes(changes)
+        except Exception as exc:
+            self._post({"type": "apply_result", "success": False,
+                        "text": "Не удалось подготовить рекомендации к применению: " + str(exc)})
+
+    def _run_apply_changes(self, changes, automatic=False):
+        self._post({"type": "status", "text": "Автоматическое применение настроек…" if automatic
+                    else "Применение подтверждённых настроек…"})
+        try:
+            safe_changes = []
+            for original in changes:
+                checked = normalize_setting_changes([original])
+                if len(checked) != 1:
+                    raise RuntimeError("Список изменений не прошёл повторную проверку безопасности.")
+                checked[0]["old"] = original.get("old")
+                safe_changes.append(checked[0])
+            if not safe_changes:
+                raise RuntimeError("Нет проверенных изменений для применения.")
+            raw_rollback = []
+            for change in safe_changes:
+                old = change.get("old")
+                if old is None or old == "" or old == "—":
+                    raise RuntimeError("Для " + change["key"] + " не сохранено прежнее значение; "
+                                       "изменение отменено, чтобы гарантировать откат.")
+                raw_rollback.append({"category": change["category"], "key": change["key"],
+                                     "value": old, "reason": "Восстановление прежнего значения"})
+            rollback = normalize_setting_changes(raw_rollback)
+            if len(rollback) != len(safe_changes):
+                raise RuntimeError("Прежние значения не прошли проверку; изменения не применялись.")
+            with self._lock:
+                self._rollback_changes = rollback
+            targets = apply_setting_changes(safe_changes)
             with self._lock:
                 self._proposed_changes = []
             self._post({"type": "apply_result", "success": True, "changes": [],
+                        "can_rollback": True, "automatic": automatic,
                         "text": "Изменения применены к активным профилям: " + ", ".join(targets) +
-                                ". Профили помечены как изменённые, но не перезаписаны на диске. "
-                                "Сохраните нужный профиль и выполните нарезку заново."})
+                                ". Прежние значения сохранены для отката. Профили не перезаписаны "
+                                "на диске; сохраните нужный профиль и выполните нарезку заново."})
         except Exception as exc:
-            self._post({"type": "apply_result", "success": False,
+            with self._lock:
+                can_rollback = bool(self._rollback_changes)
+            self._post({"type": "apply_result", "success": False, "can_rollback": can_rollback,
                         "text": "Не удалось применить изменения: " + str(exc) +
-                                ". Проверьте активные профили перед повтором."})
+                                ". Проверьте активные профили. Если часть настроек уже изменилась, "
+                                "нажмите «Откатить»."})
+
+    def _run_rollback_changes(self, rollback):
+        self._post({"type": "status", "text": "Восстановление прежних значений…"})
+        try:
+            targets = apply_setting_changes(rollback)
+            with self._lock:
+                self._rollback_changes = []
+            self._post({"type": "rollback_result", "success": True, "can_rollback": False,
+                        "text": "Прежние значения восстановлены в активных профилях: " +
+                                ", ".join(targets) + ". Проверьте профили и выполните нарезку заново."})
+        except Exception as exc:
+            self._post({"type": "rollback_result", "success": False, "can_rollback": True,
+                        "text": "Не удалось выполнить откат: " + str(exc) +
+                                ". Сохранённые значения оставлены для повторной попытки."})
 
     def _run_gcode_review(self, config, gcode, previous, generation):
         try:
@@ -1280,19 +1404,21 @@ class AIAssistantPage(orca.pages.PagesPluginCapabilityBase):
             self._waiting = False
             self._pending_actions = {}
             self._proposed_changes = []
+            self._rollback_changes = []
 
 
 DOCK_PAGE = r'''<!doctype html><html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><style>
-:root{color-scheme:light dark}*{box-sizing:border-box}html,body{height:100%;overflow:hidden}body{font-family:var(--orca-font,sans-serif);background:var(--orca-bg);color:var(--orca-fg);margin:0;display:flex;flex-direction:column}button{font:inherit;cursor:pointer;border:1px solid var(--orca-border);border-radius:8px;background:var(--orca-panel,var(--orca-bg));color:var(--orca-fg);padding:8px 9px}button:disabled{opacity:.5;cursor:default}button[hidden]{display:none}.dock-header{flex:none;padding:13px 13px 10px;border-bottom:1px solid var(--orca-border);background:var(--orca-panel,var(--orca-bg))}h2{font-size:16px;margin:0 0 10px}.row{display:flex;gap:7px}.row button{flex:1;min-width:0}.primary,#apply{background:var(--orca-accent);color:var(--orca-accent-fg);border-color:transparent}#status{margin-top:8px;font-size:11px;line-height:1.4;color:var(--orca-muted)}#dockScroll{flex:1;min-height:0;overflow:auto;padding:12px;overscroll-behavior:contain}#latest{overflow-wrap:anywhere;border:1px solid var(--orca-border);border-radius:11px;padding:12px;background:var(--orca-panel,var(--orca-bg));font-size:13px;box-shadow:0 2px 9px rgba(0,0,0,.05)}.empty{color:var(--orca-muted);line-height:1.55}.source-badge{display:inline-block;padding:2px 7px;border-radius:999px;background:var(--orca-accent);color:var(--orca-accent-fg);font-size:10px;font-weight:600;margin-bottom:9px}.markdown-body{line-height:1.6}.markdown-body p{margin:0 0 10px}.markdown-body p:last-child{margin-bottom:0}.md-heading{margin:17px 0 8px;padding-bottom:5px;border-bottom:1px solid var(--orca-border);font-size:14px;line-height:1.35;font-weight:700}.md-heading:first-child{margin-top:0}.md-heading.h1{font-size:16px}.md-heading.h2{font-size:15px}.md-list-item{display:flex;align-items:flex-start;gap:7px;margin:6px 0;padding-left:var(--indent,0px)}.md-marker{flex:none;min-width:15px;color:var(--orca-accent);font-weight:700;text-align:right}.md-item-body{flex:1;min-width:0}.md-inline-code{padding:1px 4px;border-radius:4px;background:var(--orca-code-bg,rgba(127,127,127,.14));font-family:ui-monospace,Consolas,monospace;font-size:.92em}.md-code{max-width:100%;overflow:auto;margin:10px 0;padding:10px;border:1px solid var(--orca-border);border-radius:8px;background:var(--orca-code-bg,rgba(127,127,127,.1));font:11px/1.5 ui-monospace,Consolas,monospace;white-space:pre}.md-quote{margin:10px 0;padding:6px 9px;border-left:3px solid var(--orca-accent);color:var(--orca-muted)}.section-title{margin:16px 0 8px;font-size:12px;font-weight:700}.change{padding:10px;margin:8px 0;border:1px solid var(--orca-border);border-radius:9px;font-size:12px;background:var(--orca-panel,var(--orca-bg))}.change-head{display:flex;gap:6px;align-items:center;margin-bottom:8px}.change-key{font:600 11px ui-monospace,Consolas,monospace;overflow-wrap:anywhere}.change-category{margin-left:auto;color:var(--orca-muted);font-size:9px;text-transform:uppercase}.diff{display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);align-items:center;gap:6px}.diff-value{min-width:0;padding:6px;border-radius:6px;background:var(--orca-code-bg,rgba(127,127,127,.1));font:11px ui-monospace,Consolas,monospace;overflow-wrap:anywhere}.diff-value.new{border:1px solid var(--orca-accent)}.diff-arrow{color:var(--orca-muted)}.why{color:var(--orca-muted);margin-top:7px;line-height:1.45}#apply{width:100%;margin-top:8px}#action{margin-top:10px;padding:10px;border:1px solid #b91c1c;border-radius:9px}#action:empty{display:none}#action button{width:100%;margin-top:6px}#action .confirm{background:#b91c1c;color:white;border-color:transparent}.hint{font-size:11px;color:var(--orca-muted);line-height:1.5}details{margin-top:14px;border-top:1px solid var(--orca-border);padding-top:10px}summary{cursor:pointer;font-size:11px;color:var(--orca-muted)}details .hint{margin-top:8px}
+:root{color-scheme:light dark}*{box-sizing:border-box}html,body{height:100%;overflow:hidden}body{font-family:var(--orca-font,sans-serif);background:var(--orca-bg);color:var(--orca-fg);margin:0;display:flex;flex-direction:column}button{font:inherit;cursor:pointer;border:1px solid var(--orca-border);border-radius:8px;background:var(--orca-panel,var(--orca-bg));color:var(--orca-fg);padding:8px 9px}button:disabled{opacity:.5;cursor:default}button[hidden]{display:none}.dock-header{flex:none;padding:13px 13px 10px;border-bottom:1px solid var(--orca-border);background:var(--orca-panel,var(--orca-bg))}h2{font-size:16px;margin:0 0 10px}.row{display:flex;gap:7px}.row button{flex:1;min-width:0}.apply-row{margin-top:7px}.apply-row button{font-size:11px}.primary,#apply,#applySuggested{background:var(--orca-accent);color:var(--orca-accent-fg);border-color:transparent}#status{margin-top:8px;font-size:11px;line-height:1.4;color:var(--orca-muted)}#dockScroll{flex:1;min-height:0;overflow:auto;padding:12px;overscroll-behavior:contain}#latest{overflow-wrap:anywhere;border:1px solid var(--orca-border);border-radius:11px;padding:12px;background:var(--orca-panel,var(--orca-bg));font-size:13px;box-shadow:0 2px 9px rgba(0,0,0,.05)}.empty{color:var(--orca-muted);line-height:1.55}.source-badge{display:inline-block;padding:2px 7px;border-radius:999px;background:var(--orca-accent);color:var(--orca-accent-fg);font-size:10px;font-weight:600;margin-bottom:9px}.markdown-body{line-height:1.6}.markdown-body p{margin:0 0 10px}.markdown-body p:last-child{margin-bottom:0}.md-heading{margin:17px 0 8px;padding-bottom:5px;border-bottom:1px solid var(--orca-border);font-size:14px;line-height:1.35;font-weight:700}.md-heading:first-child{margin-top:0}.md-heading.h1{font-size:16px}.md-heading.h2{font-size:15px}.md-list-item{display:flex;align-items:flex-start;gap:7px;margin:6px 0;padding-left:var(--indent,0px)}.md-marker{flex:none;min-width:15px;color:var(--orca-accent);font-weight:700;text-align:right}.md-item-body{flex:1;min-width:0}.md-inline-code{padding:1px 4px;border-radius:4px;background:var(--orca-code-bg,rgba(127,127,127,.14));font-family:ui-monospace,Consolas,monospace;font-size:.92em}.md-code{max-width:100%;overflow:auto;margin:10px 0;padding:10px;border:1px solid var(--orca-border);border-radius:8px;background:var(--orca-code-bg,rgba(127,127,127,.1));font:11px/1.5 ui-monospace,Consolas,monospace;white-space:pre}.md-quote{margin:10px 0;padding:6px 9px;border-left:3px solid var(--orca-accent);color:var(--orca-muted)}.section-title{margin:16px 0 8px;font-size:12px;font-weight:700}.change{padding:10px;margin:8px 0;border:1px solid var(--orca-border);border-radius:9px;font-size:12px;background:var(--orca-panel,var(--orca-bg))}.change-head{display:flex;gap:6px;align-items:center;margin-bottom:8px}.change-key{font:600 11px ui-monospace,Consolas,monospace;overflow-wrap:anywhere}.change-category{margin-left:auto;color:var(--orca-muted);font-size:9px;text-transform:uppercase}.diff{display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);align-items:center;gap:6px}.diff-value{min-width:0;padding:6px;border-radius:6px;background:var(--orca-code-bg,rgba(127,127,127,.1));font:11px ui-monospace,Consolas,monospace;overflow-wrap:anywhere}.diff-value.new{border:1px solid var(--orca-accent)}.diff-arrow{color:var(--orca-muted)}.why{color:var(--orca-muted);margin-top:7px;line-height:1.45}#apply{width:100%;margin-top:8px}#action{margin-top:10px;padding:10px;border:1px solid #b91c1c;border-radius:9px}#action:empty{display:none}#action button{width:100%;margin-top:6px}#action .confirm{background:#b91c1c;color:white;border-color:transparent}.hint{font-size:11px;color:var(--orca-muted);line-height:1.5}details{margin-top:14px;border-top:1px solid var(--orca-border);padding-top:10px}summary{cursor:pointer;font-size:11px;color:var(--orca-muted)}details .hint{margin-top:8px}
 </style></head><body>
-<header class="dock-header"><h2>AI Print Assistant</h2><div class="row"><button class="primary" id="optimize">Анализ настроек</button><button id="monitor">Мониторинг</button></div><div id="status">Готов</div></header>
+<header class="dock-header"><h2>AI Print Assistant</h2><div class="row"><button class="primary" id="optimize">Анализ настроек</button><button id="monitor">Мониторинг</button></div><div class="row apply-row"><button id="applySuggested">Применить рекомендации ИИ</button><button id="rollbackChanges" hidden>Откатить</button></div><div id="status">Готов</div></header>
 <main id="dockScroll"><div id="latest"><div class="empty">Запустите анализ модели — структурированные рекомендации появятся здесь и на вкладках «Подготовка» и «Нарезка».</div></div>
 <div id="changes"></div><button id="apply" hidden>Подтвердить и применить</button><div id="action"></div>
 <details><summary>Автоматическая проверка G-code</summary><div class="hint">Выберите AI G-code Review в Process → Others → Slicing Pipeline Plugin. Профили сохраняются на диск только вами.</div></details></main>
 <script>
 let config={},changes=[];const statusBox=document.getElementById('status'),latest=document.getElementById('latest');
 function textStatus(text){statusBox.textContent=text}
+function updateRollback(available){document.getElementById('rollbackChanges').hidden=!available}
 function plainMath(value){return String(value).replace(/\\times\b/g,'×').replace(/\\cdot\b/g,'·').replace(/\\pm\b/g,'±').replace(/\\leq?\b/g,'≤').replace(/\\geq?\b/g,'≥').replace(/\\(?:left|right)\b/g,'').replace(/\\text\{([^{}]*)\}/g,'$1').replace(/\$/g,'').replace(/\\([{}_^])/g,'$1')}
 function appendInline(parent,value){const text=plainMath(value),parts=text.split(/(\*\*[^*\n]+\*\*|`[^`\n]+`)/g);parts.filter(Boolean).forEach(part=>{if(part.startsWith('**')&&part.endsWith('**')){const strong=document.createElement('strong');strong.textContent=part.slice(2,-2);parent.appendChild(strong)}else if(part.startsWith('`')&&part.endsWith('`')){const code=document.createElement('code');code.className='md-inline-code';code.textContent=part.slice(1,-1);parent.appendChild(code)}else parent.appendChild(document.createTextNode(part))})}
 function renderMarkdown(container,value){container.textContent='';container.classList.add('markdown-body');const lines=String(value||'').replace(/\r\n?/g,'\n').split('\n');let paragraph=[];function flushParagraph(){if(!paragraph.length)return;const p=document.createElement('p');appendInline(p,paragraph.join(' '));container.appendChild(p);paragraph=[]}for(let i=0;i<lines.length;i++){const line=lines[i],fence=line.match(/^\s*```/);if(fence){flushParagraph();const code=document.createElement('code'),pre=document.createElement('pre');pre.className='md-code';const buffer=[];i++;while(i<lines.length&&!/^\s*```/.test(lines[i])){buffer.push(lines[i]);i++}code.textContent=buffer.join('\n');pre.appendChild(code);container.appendChild(pre);continue}const heading=line.match(/^\s{0,3}(#{1,3})\s+(.+)$/);if(heading){flushParagraph();const h=document.createElement('div');h.className='md-heading h'+heading[1].length;appendInline(h,heading[2]);container.appendChild(h);continue}const item=line.match(/^(\s*)([-*+]|\d+[.)])\s+(.+)$/);if(item){flushParagraph();const row=document.createElement('div'),marker=document.createElement('span'),body=document.createElement('div');row.className='md-list-item';row.style.setProperty('--indent',Math.min(42,Math.floor(item[1].replace(/\t/g,'  ').length/2)*12)+'px');marker.className='md-marker';marker.textContent=/\d/.test(item[2])?item[2]:'•';body.className='md-item-body';appendInline(body,item[3]);row.append(marker,body);container.appendChild(row);continue}const quote=line.match(/^\s*>\s?(.*)$/);if(quote){flushParagraph();const q=document.createElement('div');q.className='md-quote';appendInline(q,quote[1]);container.appendChild(q);continue}if(!line.trim()){flushParagraph();continue}paragraph.push(line.trim())}flushParagraph()}
@@ -1301,8 +1427,10 @@ function renderChanges(items){changes=items||[];const box=document.getElementByI
 function renderAction(data){const box=document.getElementById('action');box.textContent='';if(data.action_id==null||!data.analysis||data.analysis.proposed_action==='none')return;const note=document.createElement('div');note.className='hint';note.textContent='Действие выполняется вручную после подтверждения.';const yes=document.createElement('button');yes.className='confirm';yes.textContent='Подтвердить: '+data.analysis.proposed_action;yes.onclick=()=>orca.postMessage({type:'action_confirm',action_id:data.action_id});const no=document.createElement('button');no.textContent='Отклонить';no.onclick=()=>orca.postMessage({type:'action_reject',action_id:data.action_id});box.append(note,yes,no)}
 document.getElementById('optimize').onclick=()=>{textStatus('Анализ модели и профилей…');orca.postMessage({type:'ask',text:'Проанализируй модель и профили. Предложи консервативные setting_changes для улучшения печати.',include_context:true})};
 document.getElementById('apply').onclick=()=>{if(confirm('Применить показанные изменения к активным профилям?'))orca.postMessage({type:'apply_changes'})};
+document.getElementById('applySuggested').onclick=()=>{if(confirm('Применить рекомендации последнего анализа?'))orca.postMessage({type:'apply_suggestions'})};
+document.getElementById('rollbackChanges').onclick=()=>{if(confirm('Восстановить значения до последнего применения ИИ?'))orca.postMessage({type:'rollback_changes'})};
 document.getElementById('monitor').onclick=()=>orca.postMessage({type:config.monitor_enabled?'monitor_stop':'monitor_start'});
-orca.onMessage(data=>{if(data.type==='state'){config=data.config||{};document.getElementById('monitor').textContent=config.monitor_enabled?'Остановить мониторинг':'Мониторинг';renderChanges(data.changes||[])}else if(data.type==='status'){textStatus(data.text)}else if(data.type==='answer'){showAnswer(data.text);renderChanges(data.changes||[]);textStatus('Анализ готов');renderAction(data)}else if(data.type==='gcode_result'||data.type==='monitor_answer'){showAnswer(data.text,data.type==='gcode_result'?'G-code':'Камера');textStatus('Получен новый анализ');renderAction(data)}else if(data.type==='monitor_state'){config.monitor_enabled=data.enabled;document.getElementById('monitor').textContent=data.enabled?'Остановить мониторинг':'Мониторинг';textStatus(data.text)}else if(data.type==='apply_result'){textStatus(data.text);if(data.success){const b=document.getElementById('apply');b.disabled=true;b.textContent='Изменения применены'}}else if(data.type==='error'){textStatus(data.text)}else if(data.type==='action_result'){textStatus(data.text);document.getElementById('action').textContent=''}});
+orca.onMessage(data=>{if(data.type==='state'){config=data.config||{};document.getElementById('monitor').textContent=config.monitor_enabled?'Остановить мониторинг':'Мониторинг';updateRollback(!!data.can_rollback);renderChanges(data.changes||[])}else if(data.type==='status'){textStatus(data.text)}else if(data.type==='answer'){showAnswer(data.text);renderChanges(data.changes||[]);textStatus('Анализ готов');renderAction(data)}else if(data.type==='gcode_result'||data.type==='monitor_answer'){showAnswer(data.text,data.type==='gcode_result'?'G-code':'Камера');textStatus('Получен новый анализ');renderAction(data)}else if(data.type==='monitor_state'){config.monitor_enabled=data.enabled;document.getElementById('monitor').textContent=data.enabled?'Остановить мониторинг':'Мониторинг';textStatus(data.text)}else if(data.type==='apply_result'){textStatus(data.text);updateRollback(!!data.can_rollback);if(data.success){renderChanges([]);const b=document.getElementById('apply');b.disabled=true;b.textContent='Изменения применены'}}else if(data.type==='rollback_result'){textStatus(data.text);updateRollback(!!data.can_rollback)}else if(data.type==='error'){textStatus(data.text)}else if(data.type==='action_result'){textStatus(data.text);document.getElementById('action').textContent=''}});
 orca.postMessage({type:'dock_ready'});
 </script></body></html>'''
 
