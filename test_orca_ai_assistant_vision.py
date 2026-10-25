@@ -519,7 +519,7 @@ class VisionPluginTests(unittest.TestCase):
     def test_printer_modifications_are_saved_and_added_to_context(self):
         page = plugin.AIAssistantPage()
         PagesBase.__init__(page)
-        mods = "Ender-3 V3 SE; сопло Unicorn от K1 Max"
+        mods = "Тестовый принтер; другое сопло"
         payload = config()
         payload.update({"type": "save_settings", "printer_mods": "  " + mods + "  "})
         page.on_message(payload)
@@ -529,23 +529,33 @@ class VisionPluginTests(unittest.TestCase):
 
     def test_printer_modifications_reach_recommendations_and_gcode_review(self):
         configured = config()
-        configured["printer_mods"] = "Ender-3 V3 SE; сопло Unicorn от K1 Max"
+        configured["printer_mods"] = "Тестовый принтер; другое сопло"
         payload = json.dumps({"setting_changes": []})
         with mock.patch.object(plugin, "request_chat", return_value=payload) as request:
             plugin.extract_recommended_changes(configured, {"answer": "Проверьте расход"}, {})
-        self.assertIn("сопло Unicorn от K1 Max", request.call_args.args[1][-1]["content"])
+        self.assertIn("другое сопло", request.call_args.args[1][-1]["content"])
         with mock.patch.object(plugin, "request_chat", return_value=result()) as request:
             plugin.run_gcode_review(configured, {"lines": 10})
-        self.assertIn("сопло Unicorn от K1 Max", request.call_args.args[1][-1]["content"])
+        self.assertIn("другое сопло", request.call_args.args[1][-1]["content"])
 
     def test_printer_modifications_ui_default_and_prompt_priority(self):
         self.assertIn('textarea id="printer_mods"', plugin.PAGE)
         self.assertIn("'printer_mods'", plugin.PAGE)
         self.assertIn("имеет приоритет над названием пресета", plugin.LOGIC_PROMPT)
-        self.assertEqual(
-            plugin.DEFAULT_CONFIG["printer_mods"],
-            "Creality Ender-3 V3 SE; установлено сопло Unicorn от K1 Max (пользовательский апгрейд).",
-        )
+        self.assertEqual(plugin.DEFAULT_CONFIG["printer_mods"], "")
+
+    def test_settings_dialog_separates_printer_and_api_tabs(self):
+        self.assertIn('id="settings">Настройки</button>', plugin.PAGE)
+        self.assertIn('id="printerTab"', plugin.PAGE)
+        self.assertIn('id="apiTab"', plugin.PAGE)
+        self.assertIn('aria-labelledby="apiTab" hidden', plugin.PAGE)
+        self.assertIn("function setSettingsTab(name)", plugin.PAGE)
+        printer_panel = plugin.PAGE.split('id="printerSettings"', 1)[1].split('id="apiSettings"', 1)[0]
+        for field in ("printer_mods", "auto_apply", "monitor_url"):
+            self.assertIn('id="' + field + '"', printer_panel)
+        api_panel = plugin.PAGE.split('id="apiSettings"', 1)[1]
+        self.assertIn('id="textFields"', api_panel)
+        self.assertIn('id="forget"', api_panel)
 
 
 if __name__ == "__main__":
