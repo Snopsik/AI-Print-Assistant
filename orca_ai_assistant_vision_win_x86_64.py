@@ -6,7 +6,7 @@
 # name = "AI Print Assistant"
 # description = "Cloud AI co-pilot with confirmed profile edits, G-code review, camera monitoring, and an interactive Prepare/Preview panel. Never controls the printer directly."
 # author = "Kimi"
-# version = "2.5.1"
+# version = "2.6.0"
 # ///
 
 import base64
@@ -40,6 +40,7 @@ DEFAULT_CONFIG = {
     "vision_model": "gpt-4.1-mini",
     "vision_api_key": "",
     "monitor_url": "",
+    "klipper_url": "",
     "monitor_interval": 60,
     "monitor_enabled": False,
     "auto_apply": False,
@@ -121,6 +122,10 @@ LOGIC_PROMPT = r'''Ты — текстовый инженерный ассист
 Оно имеет приоритет над названием пресета: не подставляй другой принтер, хотэнд или экструдер.
 Учитывай эти модификации при рекомендациях по температуре, расходу, скорости, ретракту и охлаждению.
 Не выдумывай характеристики неизвестной модификации; если они критичны, отметь неопределённость.
+Поле klipper содержит снимок config и state, полученный из Moonraker только для чтения. Сопоставляй
+его с настройками Orca и дефектом. Если нужна корректировка Klipper, укажи точную [секцию], параметр,
+текущее и рекомендуемое значение, способ безопасной проверки и риски. Не включай такие правки в Orca
+setting_changes, не выдавай команды принтеру и не утверждай, что конфигурация Klipper уже изменена.
 
 Если получен отчёт зрения, сопоставь его с вопросом и профилем. Если чего-то важного не видно,
 запроси один targeted повторный анализ того же изображения через needs_vision_verification.
@@ -202,11 +207,12 @@ def _vector(value):
         return _plain(value)
 
 
-def collect_context(printer_mods=""):
+def collect_context(printer_mods="", klipper_context=None):
     # app_language() is absent in early 2.5.0-alpha plugin APIs.
     context = {
         "orca_ui_language": _attr(orca.host, "app_language", "ru_RU"),
         "printer_modifications": str(printer_mods).strip()[:4000],
+        "klipper": _plain(klipper_context or {}),
     }
     try:
         bundle = orca.host.preset_bundle()
@@ -561,13 +567,15 @@ def extract_recommended_changes(config, analysis, context):
     prompt = r'''Ты преобразуешь рекомендации FDM-печати в параметры OrcaSlicer. Отвечай на русском.
 Используй только изменения, которые явно предложены в тексте анализа и поддерживаются текущим
 снимком print_settings. Не выдумывай значения, не меняй printer_model. Категория должна точно
-соответствовать ключу. Верни ТОЛЬКО JSON:
+соответствовать ключу. Данные klipper используй только для сопоставления, не преобразуй параметры
+Klipper в ключи Orca. Верни ТОЛЬКО JSON:
 {"setting_changes":[{"category":"process|filament|printer","key":"точный ключ Orca",
 "value":"новое значение","reason":"краткое обоснование"}]}
 Если безопасно извлечь изменения нельзя, верни {"setting_changes":[]}.'''
     packet = {
         "analysis_answer": str(analysis.get("answer", ""))[:16000],
         "printer_modifications": context.get("printer_modifications", config.get("printer_mods", "")),
+        "klipper": context.get("klipper", {}),
         "print_settings": context.get("print_settings", {}),
     }
     raw = request_chat(service_for(config, "text"), [
@@ -681,6 +689,7 @@ def run_analysis(config, question, context, history, image_data, status=lambda t
 GCODE_PROMPT = r'''Ты — инженерный аудитор G-code FDM-печати. Отвечай на русском.
 Проверь статистику и фрагменты G-code вместе с предыдущим анализом модели и предложенными
 настройками и учитывай printer_modifications как описание реального оборудования пользователя.
+Сопоставляй команды G-code со снимком klipper config/state, но не предполагай отсутствующие данные.
 Ищи несоответствия температур, охлаждения, скоростей, высоты слоёв, пауз,
 остановов и небезопасные машинные команды. Не утверждай, что проверил то, чего нет во входных
 данных. В answer дай главный итог, затем при необходимости «### Замечания» и «### Что проверить»
@@ -755,9 +764,10 @@ def summarize_gcode_file(path):
         return summarize_gcode(handle.read())
 
 
-def run_gcode_review(config, summary, previous_analysis=None):
+def run_gcode_review(config, summary, previous_analysis=None, klipper_context=None):
     packet = {"gcode": summary, "previous_model_analysis": previous_analysis or {},
-              "printer_modifications": config.get("printer_mods", "")}
+              "printer_modifications": config.get("printer_mods", ""),
+              "klipper": _plain(klipper_context or {})}
     messages = [
         {"role": "system", "content": GCODE_PROMPT},
         {"role": "user", "content": json.dumps(packet, ensure_ascii=False, separators=(",", ":"))},
@@ -765,6 +775,110 @@ def run_gcode_review(config, summary, previous_analysis=None):
     result = normalize_result(request_chat(service_for(config, "text"), messages))
     result["setting_changes"] = []
     return result
+
+
+KLIPPER_QUERY_OBJECTS = (
+    "configfile", "gcode_move", "toolhead", "extruder", "heater_bed",
+    "fan", "print_stats", "pause_resume",
+)
+KLIPPER_CONFIG_SECTIONS = {
+    "printer", "extruder", "heater_bed", "fan", "input_shaper", "bed_mesh",
+    "probe", "bltouch", "safe_z_home",
+}
+KLIPPER_CONFIG_PREFIXES = (
+    "stepper_", "tmc", "fan_generic ", "heater_fan ", "controller_fan ",
+    "temperature_fan ", "verify_heater ",
+)
+KLIPPER_CONFIG_KEYS = {
+    "kinematics", "max_velocity", "max_accel", "max_accel_to_decel",
+    "max_z_velocity", "max_z_accel", "minimum_cruise_ratio", "square_corner_velocity",
+    "nozzle_diameter", "filament_diameter", "pressure_advance",
+    "pressure_advance_smooth_time", "max_extrude_only_velocity", "max_extrude_only_accel",
+    "max_extrude_only_distance", "max_extrude_cross_section", "max_extrude_ratio",
+    "rotation_distance", "microsteps", "full_steps_per_rotation", "gear_ratio",
+    "run_current", "hold_current", "stealthchop_threshold", "sensor_type", "control",
+    "pid_kp", "pid_ki", "pid_kd", "min_temp", "max_temp", "min_extrude_temp",
+    "max_power", "off_below", "kick_start_time", "cycle_time", "hardware_pwm",
+    "pwm_cycle_time", "heater", "heater_temp", "target_temp", "max_error",
+    "check_gain_time", "shaper_type_x", "shaper_type_y", "shaper_freq_x",
+    "shaper_freq_y", "damping_ratio_x", "damping_ratio_y", "mesh_min", "mesh_max",
+    "probe_count", "algorithm", "relative_reference_index", "zero_reference_position",
+    "fade_start", "fade_end", "fade_target", "x_offset", "y_offset", "z_offset",
+    "speed", "samples", "samples_result", "sample_retract_dist", "lift_speed",
+}
+KLIPPER_STATE_FIELDS = {
+    "gcode_move": {"speed_factor", "extrude_factor", "speed", "absolute_coordinates",
+                   "absolute_extrude", "gcode_position"},
+    "toolhead": {"position", "homed_axes", "print_time", "estimated_print_time",
+                 "max_velocity", "max_accel", "minimum_cruise_ratio",
+                 "square_corner_velocity", "stalls", "extruder"},
+    "extruder": {"temperature", "target", "pressure_advance", "smooth_time", "power"},
+    "heater_bed": {"temperature", "target", "power"},
+    "fan": {"speed", "rpm"},
+    "print_stats": {"state", "message", "filename", "total_duration", "print_duration",
+                    "filament_used", "info"},
+    "pause_resume": {"is_paused"},
+}
+
+
+def validate_klipper_url(url):
+    value = str(url).strip().rstrip("/")
+    parsed = urllib.parse.urlsplit(value)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError("URL Moonraker должен начинаться с http:// или https://")
+    if parsed.username or parsed.password:
+        raise ValueError("Не вставляйте логин и пароль в URL Moonraker.")
+    if parsed.query or parsed.fragment:
+        raise ValueError("Укажите базовый URL Moonraker без параметров запроса.")
+    return value
+
+
+def summarize_klipper_status(status):
+    if not isinstance(status, dict) or not isinstance(status.get("configfile"), dict):
+        raise RuntimeError("Moonraker не вернул configfile. Проверьте подключение к Klipper.")
+    raw_config = status["configfile"].get("config", {})
+    config = {}
+    if isinstance(raw_config, dict):
+        for section, values in raw_config.items():
+            name = str(section)
+            if name not in KLIPPER_CONFIG_SECTIONS and not name.startswith(KLIPPER_CONFIG_PREFIXES):
+                continue
+            if not isinstance(values, dict):
+                continue
+            filtered = {str(key): _plain(value) for key, value in values.items()
+                        if str(key).lower() in KLIPPER_CONFIG_KEYS}
+            if filtered:
+                config[name] = filtered
+    state = {}
+    for name, fields in KLIPPER_STATE_FIELDS.items():
+        values = status.get(name)
+        if isinstance(values, dict):
+            state[name] = {str(key): _plain(value) for key, value in values.items()
+                           if str(key) in fields}
+    return {"config": config, "state": state}
+
+
+def fetch_klipper_context(url):
+    base = validate_klipper_url(url)
+    payload = json.dumps({"objects": {name: None for name in KLIPPER_QUERY_OBJECTS}}).encode()
+    request = urllib.request.Request(
+        base + "/printer/objects/query", data=payload,
+        headers={"Accept": "application/json", "Content-Type": "application/json",
+                 "User-Agent": "OrcaSlicer-AI-Print-Assistant/2.6"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=12) as response:
+            validate_klipper_url(response.geturl())
+            raw = response.read(4 * 1024 * 1024 + 1)
+    except urllib.error.URLError as exc:
+        raise RuntimeError("Не удалось получить настройки Klipper: " + str(exc.reason)) from None
+    if len(raw) > 4 * 1024 * 1024:
+        raise RuntimeError("Ответ Moonraker больше 4 МБ.")
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise RuntimeError("Moonraker вернул некорректный JSON.") from None
+    return summarize_klipper_status(data.get("status"))
 
 
 def validate_monitor_url(url):
@@ -829,6 +943,7 @@ body{overflow:hidden}.wrap{min-width:0}header{flex:none;flex-wrap:wrap;backgroun
 <section class="settings-panel" id="printerSettings" role="tabpanel" aria-labelledby="printerTab">
 <fieldset><legend>Модификации принтера</legend><label>Реальный принтер и установленные апгрейды<textarea id="printer_mods" rows="4" maxlength="4000" placeholder="Например: модель принтера; другое сопло, экструдер, вентилятор или стол"></textarea></label><div class="hint">Это описание имеет приоритет над названием пресета при анализе. Указывайте только установленные модификации; точные неизвестные характеристики ИИ не должен выдумывать.</div></fieldset>
 <fieldset><legend>Применение рекомендаций</legend><label class="hint"><input type="checkbox" id="auto_apply" style="width:auto;display:inline"> автоматически применять проверенные настройки после анализа</label><div class="hint">Действует только на структурированные setting_changes, прошедшие проверку ключей и диапазонов. Прежние значения сохраняются для ручного отката. По умолчанию выключено.</div></fieldset>
+<fieldset><legend>Klipper / Moonraker</legend><label>Базовый URL Moonraker<input id="klipper_url" spellcheck="false" placeholder="http://printer.local:7125"></label><button type="button" class="iconbtn" id="loadKlipper">Загрузить настройки Klipper</button><div class="hint" id="klipper_state">Настройки Klipper ещё не загружены.</div><div class="hint">Только чтение конфигурации и состояния через Moonraker. Плагин не отправляет G-code и не меняет printer.cfg. Загруженный снимок передаётся облачному ИИ при анализе.</div></fieldset>
 <fieldset><legend>Автоматический мониторинг камеры</legend><label>Прямой URL JPEG/PNG/WebP снимка<input id="monitor_url" spellcheck="false" placeholder="http://printer.local/webcam/?action=snapshot"></label><label>Интервал анализа, секунды (30–3600)<input id="monitor_interval" type="number" min="30" max="3600" step="1"></label><div class="hint">Каждый снимок отправляется выбранному облачному AI. Видеопотоки MJPEG не поддерживаются. Опасные действия требуют подтверждения и выполняются вручную.</div></fieldset>
 </section>
 <section class="settings-panel" id="apiSettings" role="tabpanel" aria-labelledby="apiTab" hidden>
@@ -841,7 +956,7 @@ body{overflow:hidden}.wrap{min-width:0}header{flex:none;flex-wrap:wrap;backgroun
 const chat=document.getElementById('chat'),input=document.getElementById('input'),send=document.getElementById('send'),busy=document.getElementById('busy'),dialog=document.getElementById('settingsDialog');
 let waiting=false,attachment='',savedConfig={},modelCache={text:[],vision:[]};
 const PROVIDER_ENDPOINTS={openai:'https://api.openai.com/v1/chat/completions',gemini:'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions',glm:'https://api.z.ai/api/paas/v4/chat/completions',openrouter:'https://openrouter.ai/api/v1/chat/completions'};
-const ids=['mode','text_provider','text_endpoint','text_model','vision_provider','vision_endpoint','vision_model','monitor_url','monitor_interval','printer_mods'];
+const ids=['mode','text_provider','text_endpoint','text_model','vision_provider','vision_endpoint','vision_model','monitor_url','klipper_url','monitor_interval','printer_mods'];
 function scrollBottom(){chat.scrollTop=chat.scrollHeight}
 function plainMath(value){return String(value).replace(/\\times\b/g,'×').replace(/\\cdot\b/g,'·').replace(/\\pm\b/g,'±').replace(/\\leq?\b/g,'≤').replace(/\\geq?\b/g,'≥').replace(/\\(?:left|right)\b/g,'').replace(/\\text\{([^{}]*)\}/g,'$1').replace(/\$/g,'').replace(/\\([{}_^])/g,'$1')}
 function appendInline(parent,value){const text=plainMath(value),parts=text.split(/(\*\*[^*\n]+\*\*|`[^`\n]+`)/g);parts.filter(Boolean).forEach(part=>{if(part.startsWith('**')&&part.endsWith('**')){const strong=document.createElement('strong');strong.textContent=part.slice(2,-2);parent.appendChild(strong)}else if(part.startsWith('`')&&part.endsWith('`')){const code=document.createElement('code');code.className='md-inline-code';code.textContent=part.slice(1,-1);parent.appendChild(code)}else parent.appendChild(document.createTextNode(part))})}
@@ -867,20 +982,21 @@ document.getElementById('clear').onclick=()=>{if(waiting)return;orca.postMessage
 function clearAttachment(){attachment='';document.getElementById('file').value='';document.getElementById('attachmentPreview').textContent=''}
 document.getElementById('attach').onclick=()=>document.getElementById('file').click();document.getElementById('file').onchange=e=>{const file=e.target.files[0];if(!file)return;if(file.size>15*1024*1024){addMessage('assistant','Файл больше 15 МБ.',true);return}const reader=new FileReader();reader.onerror=()=>addMessage('assistant','Не удалось прочитать изображение.',true);reader.onload=()=>{const img=new Image();img.onerror=()=>addMessage('assistant','Формат изображения не поддерживается.',true);img.onload=()=>{const scale=Math.min(1,1600/Math.max(img.width,img.height));const canvas=document.createElement('canvas');canvas.width=Math.max(1,Math.round(img.width*scale));canvas.height=Math.max(1,Math.round(img.height*scale));canvas.getContext('2d').drawImage(img,0,0,canvas.width,canvas.height);attachment=canvas.toDataURL('image/jpeg',.86);document.getElementById('attachmentPreview').textContent='Изображение прикреплено: '+canvas.width+'×'+canvas.height+' (JPEG)' };img.src=reader.result};reader.readAsDataURL(file)};
 function updateProvider(kind){const provider=document.getElementById(kind+'_provider').value,custom=provider==='custom';document.getElementById(kind+'_custom_endpoint').hidden=!custom;if(!custom)document.getElementById(kind+'_endpoint').value=PROVIDER_ENDPOINTS[provider]||''}
-function fillForm(){ids.forEach(id=>document.getElementById(id).value=savedConfig[id]??'');document.getElementById('auto_apply').checked=!!savedConfig.auto_apply;['text','vision'].forEach(updateProvider);document.getElementById('text_api_key').value='';document.getElementById('vision_api_key').value='';document.getElementById('text_key_state').textContent=savedConfig.has_text_key?'Ключ сохранён':'Ключ не сохранён';document.getElementById('vision_key_state').textContent=savedConfig.has_vision_key?'Ключ сохранён':'Ключ не сохранён';updateMode();updateMonitor();document.getElementById('status').textContent=''}
+function fillForm(){ids.forEach(id=>document.getElementById(id).value=savedConfig[id]??'');document.getElementById('auto_apply').checked=!!savedConfig.auto_apply;['text','vision'].forEach(updateProvider);document.getElementById('text_api_key').value='';document.getElementById('vision_api_key').value='';document.getElementById('text_key_state').textContent=savedConfig.has_text_key?'Ключ сохранён':'Ключ не сохранён';document.getElementById('vision_key_state').textContent=savedConfig.has_vision_key?'Ключ сохранён':'Ключ не сохранён';document.getElementById('klipper_state').textContent=savedConfig.klipper_summary||'Настройки Klipper ещё не загружены.';updateMode();updateMonitor();document.getElementById('status').textContent=''}
 function updateMode(){document.getElementById('visionFields').disabled=document.getElementById('mode').value!=='separate'}
 function setSettingsTab(name){['printer','api'].forEach(kind=>{const active=kind===name;document.getElementById(kind+'Settings').hidden=!active;document.getElementById(kind+'Tab').classList.toggle('active',active);document.getElementById(kind+'Tab').setAttribute('aria-selected',String(active))})}
 ['printer','api'].forEach(kind=>document.getElementById(kind+'Tab').onclick=()=>setSettingsTab(kind));
 ['text','vision'].forEach(kind=>document.getElementById(kind+'_provider').onchange=()=>{updateProvider(kind);modelCache[kind]=[];renderModels(kind)});
 document.getElementById('mode').onchange=updateMode;document.getElementById('settings').onclick=()=>{fillForm();setSettingsTab('printer');dialog.showModal()};
 document.getElementById('closeSettings').onclick=()=>dialog.close();
+document.getElementById('loadKlipper').onclick=()=>{document.getElementById('klipper_state').textContent='Загрузка настроек Klipper…';orca.postMessage({type:'klipper_refresh',url:document.getElementById('klipper_url').value.trim()})};
 document.getElementById('save').onclick=()=>{const payload={type:'save_settings'};ids.forEach(id=>payload[id]=document.getElementById(id).value.trim());payload.text_api_key=document.getElementById('text_api_key').value;payload.vision_api_key=document.getElementById('vision_api_key').value;payload.auto_apply=document.getElementById('auto_apply').checked;orca.postMessage(payload);document.getElementById('status').textContent='Сохранение…'};
 document.getElementById('forget').onclick=()=>orca.postMessage({type:'forget_keys'});
 function discover(kind){orca.postMessage({type:'discover',target:kind});document.getElementById('status').textContent='Получение списка моделей…'}
 document.getElementById('discover_text').onclick=()=>discover('text');document.getElementById('discover_vision').onclick=()=>discover('vision');
 function renderModels(kind){const items=modelCache[kind]||[],only=document.getElementById(kind==='text'?'visionOnlyText':'visionOnlyVision').checked,box=document.getElementById(kind+'_models'),list=document.getElementById(kind+'_model_list');box.textContent='';list.textContent='';items.filter(m=>!only||m.vision==='yes').forEach(m=>{const option=document.createElement('option');option.value=m.id;list.appendChild(option);const row=document.createElement('div');row.className='modelitem';const name=document.createElement('span');name.textContent=m.id;const tag=document.createElement('span');tag.className='tag';tag.textContent=m.vision==='yes'?'👁 зрение':m.vision==='no'?'без зрения':'зрение не указано';row.append(name,tag);row.onclick=()=>document.getElementById(kind+'_model').value=m.id;box.appendChild(row)});if(!box.children.length)box.textContent='Нет моделей по выбранному фильтру.'}
 ['Text','Vision'].forEach(s=>document.getElementById('visionOnly'+s).onchange=()=>renderModels(s.toLowerCase()));
-orca.onMessage(data=>{if(data.type==='state'){savedConfig=data.config||{};fillForm();updateRollback(!!data.can_rollback);renderChanges(data.changes||[])}else if(data.type==='status'){busy.textContent=data.text}else if(data.type==='answer'){const bubble=addMessage('assistant',data.text);if(data.analysis&&data.analysis.risk!=='none'){const risk=document.createElement('span');risk.className='risk '+data.analysis.risk;risk.textContent=data.analysis.risk==='critical'?'Высокий риск':'Предупреждение';bubble.prepend(risk)}renderChanges(data.changes||[]);addAction(data);setWaiting(false)}else if(data.type==='gcode_result'||data.type==='monitor_answer'){addMessage('assistant',data.text,false,'',data.type==='gcode_result'?'G-code':'Камера');addAction(data);if(data.type==='gcode_result')setWaiting(false)}else if(data.type==='monitor_state'){savedConfig.monitor_enabled=data.enabled;updateMonitor();addMessage('assistant',data.text)}else if(data.type==='apply_result'){addMessage('assistant',data.text,!data.success);updateRollback(!!data.can_rollback);if(data.success){renderChanges([]);const b=document.getElementById('applyChanges');b.disabled=true;b.textContent='Изменения применены'}}else if(data.type==='rollback_result'){addMessage('assistant',data.text,!data.success);updateRollback(!!data.can_rollback)}else if(data.type==='error'){addMessage('assistant',data.text,true);setWaiting(false)}else if(data.type==='settings_saved'){document.getElementById('status').textContent='Сохранено';orca.postMessage({type:'ready'})}else if(data.type==='settings_error'){document.getElementById('status').textContent=data.text}else if(data.type==='models'){modelCache[data.target]=data.models;renderModels(data.target);document.getElementById('status').textContent='Найдено моделей: '+data.models.length}else if(data.type==='action_result'){const box=document.getElementById('action-'+data.action_id);if(box){box.querySelectorAll('button').forEach(b=>b.disabled=true);const note=document.createElement('div');note.className='hint';note.textContent=data.text;box.appendChild(note)}}});
+orca.onMessage(data=>{if(data.type==='state'){savedConfig=data.config||{};fillForm();updateRollback(!!data.can_rollback);renderChanges(data.changes||[])}else if(data.type==='status'){busy.textContent=data.text}else if(data.type==='answer'){const bubble=addMessage('assistant',data.text);if(data.analysis&&data.analysis.risk!=='none'){const risk=document.createElement('span');risk.className='risk '+data.analysis.risk;risk.textContent=data.analysis.risk==='critical'?'Высокий риск':'Предупреждение';bubble.prepend(risk)}renderChanges(data.changes||[]);addAction(data);setWaiting(false)}else if(data.type==='gcode_result'||data.type==='monitor_answer'){addMessage('assistant',data.text,false,'',data.type==='gcode_result'?'G-code':'Камера');addAction(data);if(data.type==='gcode_result')setWaiting(false)}else if(data.type==='monitor_state'){savedConfig.monitor_enabled=data.enabled;updateMonitor();addMessage('assistant',data.text)}else if(data.type==='apply_result'){addMessage('assistant',data.text,!data.success);updateRollback(!!data.can_rollback);if(data.success){renderChanges([]);const b=document.getElementById('applyChanges');b.disabled=true;b.textContent='Изменения применены'}}else if(data.type==='rollback_result'){addMessage('assistant',data.text,!data.success);updateRollback(!!data.can_rollback)}else if(data.type==='error'){addMessage('assistant',data.text,true);setWaiting(false)}else if(data.type==='klipper_state'){savedConfig.klipper_loaded=!!data.success;savedConfig.klipper_summary=data.text;const state=document.getElementById('klipper_state');state.textContent=data.text;state.classList.toggle('error',!data.success)}else if(data.type==='settings_saved'){document.getElementById('status').textContent='Сохранено';orca.postMessage({type:'ready'})}else if(data.type==='settings_error'){document.getElementById('status').textContent=data.text}else if(data.type==='models'){modelCache[data.target]=data.models;renderModels(data.target);document.getElementById('status').textContent='Найдено моделей: '+data.models.length}else if(data.type==='action_result'){const box=document.getElementById('action-'+data.action_id);if(box){box.querySelectorAll('button').forEach(b=>b.disabled=true);const note=document.createElement('div');note.className='hint';note.textContent=data.text;box.appendChild(note)}}});
 orca.postMessage({type:'ready'});
 </script></body></html>'''
 
@@ -901,6 +1017,7 @@ class AIAssistantPage(orca.pages.PagesPluginCapabilityBase):
         self._dock = None
         self._monitor_thread = None
         self._monitor_wake = threading.Event()
+        self._klipper_context = {}
         self._lock = threading.Lock()
 
     def get_name(self):
@@ -971,10 +1088,17 @@ class AIAssistantPage(orca.pages.PagesPluginCapabilityBase):
         config["monitor_enabled"] = bool(config.get("monitor_enabled")) and bool(config.get("monitor_url"))
         config["auto_apply"] = config.get("auto_apply") in (True, 1, "1", "true", "on")
         config["printer_mods"] = str(config.get("printer_mods", "")).strip()[:4000]
+        config["klipper_url"] = str(config.get("klipper_url", "")).strip()
         return config
 
     def _public_config(self):
         config = self._config()
+        loaded = bool(self._klipper_context)
+        summary = ("Klipper загружен: секций конфигурации — " +
+                   str(len(self._klipper_context.get("config", {}))) +
+                   ", объектов состояния — " +
+                   str(len(self._klipper_context.get("state", {}))) if loaded else
+                   "Настройки Klipper ещё не загружены.")
         return {
             "mode": config["mode"],
             "text_provider": config["text_provider"],
@@ -986,6 +1110,9 @@ class AIAssistantPage(orca.pages.PagesPluginCapabilityBase):
             "has_text_key": bool(str(config.get("text_api_key", "")).strip()),
             "has_vision_key": bool(str(config.get("vision_api_key", "")).strip()),
             "monitor_url": config["monitor_url"],
+            "klipper_url": config["klipper_url"],
+            "klipper_loaded": loaded,
+            "klipper_summary": summary,
             "monitor_interval": config["monitor_interval"],
             "monitor_enabled": config["monitor_enabled"],
             "auto_apply": config["auto_apply"],
@@ -1022,10 +1149,11 @@ class AIAssistantPage(orca.pages.PagesPluginCapabilityBase):
             return
         if kind == "save_settings":
             current = self._config()
+            previous_klipper_url = current["klipper_url"]
             current["auto_apply"] = data.get("auto_apply") is True
             for field in ("mode", "text_provider", "text_endpoint", "text_model",
                           "vision_provider", "vision_endpoint", "vision_model", "monitor_url",
-                          "printer_mods"):
+                          "klipper_url", "printer_mods"):
                 if field in data:
                     current[field] = str(data[field]).strip()
             if current["mode"] not in ("unified", "separate"):
@@ -1042,6 +1170,8 @@ class AIAssistantPage(orca.pages.PagesPluginCapabilityBase):
                     "monitor_interval", current["monitor_interval"]))))
                 if current["monitor_url"]:
                     validate_monitor_url(current["monitor_url"])
+                if current["klipper_url"]:
+                    current["klipper_url"] = validate_klipper_url(current["klipper_url"])
                 validate_service({
                     "endpoint": current["text_endpoint"],
                     "model": current["text_model"],
@@ -1058,6 +1188,8 @@ class AIAssistantPage(orca.pages.PagesPluginCapabilityBase):
                 return
             saved = self._save(current)
             if saved:
+                if current["klipper_url"] != previous_klipper_url:
+                    self._klipper_context = {}
                 self._stop_monitor()
                 if current["monitor_enabled"]:
                     self._start_monitor()
@@ -1072,6 +1204,11 @@ class AIAssistantPage(orca.pages.PagesPluginCapabilityBase):
                 self._post({"type": "settings_saved"})
             else:
                 self._post({"type": "settings_error", "text": "Не удалось удалить ключи."})
+            return
+        if kind == "klipper_refresh":
+            current = self._config()
+            url = str(data.get("url", current["klipper_url"])).strip()
+            self._start_thread(self._run_klipper_refresh, url)
             return
         if kind == "discover":
             target = data.get("target")
@@ -1179,7 +1316,7 @@ class AIAssistantPage(orca.pages.PagesPluginCapabilityBase):
         try:
             if image:
                 validate_image(image)
-            context = (collect_context(config["printer_mods"])
+            context = (collect_context(config["printer_mods"], self._klipper_context)
                        if data.get("include_context", True) else {})
         except Exception as exc:
             with self._lock:
@@ -1206,6 +1343,22 @@ class AIAssistantPage(orca.pages.PagesPluginCapabilityBase):
         with self._lock:
             self._waiting = False
         self._post({"type": "error", "text": "Не удалось запустить запрос: " + str(exc)})
+
+    def _run_klipper_refresh(self, url):
+        self._klipper_context = {}
+        try:
+            normalized = validate_klipper_url(url)
+            context = fetch_klipper_context(normalized)
+            current = self._config()
+            current["klipper_url"] = normalized
+            if not self._save(current):
+                raise RuntimeError("Не удалось сохранить URL Moonraker.")
+            self._klipper_context = context
+            self._post({"type": "klipper_state", "success": True,
+                        "text": self._public_config()["klipper_summary"]})
+        except Exception as exc:
+            self._post({"type": "klipper_state", "success": False,
+                        "text": "Ошибка Klipper: " + str(exc)})
 
     def _run_discovery(self, service, target):
         try:
@@ -1266,7 +1419,7 @@ class AIAssistantPage(orca.pages.PagesPluginCapabilityBase):
             if not changes:
                 self._post({"type": "status", "text": "Преобразование рекомендаций в настройки Orca…"})
                 config = self._config()
-                context = collect_context(config["printer_mods"])
+                context = collect_context(config["printer_mods"], self._klipper_context)
                 extracted = extract_recommended_changes(config, analysis, context)
                 settings = context.get("print_settings", {})
                 for change in extracted:
@@ -1348,7 +1501,7 @@ class AIAssistantPage(orca.pages.PagesPluginCapabilityBase):
     def _run_gcode_review(self, config, gcode, previous, generation):
         try:
             summary = summarize_gcode(gcode)
-            result = run_gcode_review(config, summary, previous)
+            result = run_gcode_review(config, summary, previous, self._klipper_context)
             with self._lock:
                 if generation != self._generation:
                     return
@@ -1366,7 +1519,7 @@ class AIAssistantPage(orca.pages.PagesPluginCapabilityBase):
         """Called by the optional slicing-pipeline capability after G-code export."""
         with self._lock:
             previous = dict(self._last_analysis)
-        result = run_gcode_review(self._config(), summary, previous)
+        result = run_gcode_review(self._config(), summary, previous, self._klipper_context)
         with self._lock:
             action_id = self._register_action_locked(result)
         self._post({"type": "gcode_result", "text": result["answer"],
@@ -1400,7 +1553,7 @@ class AIAssistantPage(orca.pages.PagesPluginCapabilityBase):
             try:
                 self._post({"type": "status", "text": "Мониторинг: получение снимка…"})
                 image = fetch_camera_snapshot(config["monitor_url"])
-                context = collect_context(config["printer_mods"])
+                context = collect_context(config["printer_mods"], self._klipper_context)
                 result = run_analysis(
                     config,
                     "Проконтролируй текущую печать по новому снимку камеры. Оцени отлипание, "
