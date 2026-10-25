@@ -6,7 +6,7 @@
 # name = "AI Print Assistant"
 # description = "Cloud text and vision assistant with model discovery, collaborative image verification, print-risk guidance, and explicit user confirmation. Never controls the printer directly."
 # author = "Kimi"
-# version = "2.1.0"
+# version = "2.1.1"
 # ///
 
 import base64
@@ -561,6 +561,7 @@ orca.postMessage({type:'ready'});
 
 class AIAssistantPage(orca.pages.PagesPluginCapabilityBase):
     def __init__(self):
+        super().__init__()
         self._history = []
         self._waiting = False
         self._generation = 0
