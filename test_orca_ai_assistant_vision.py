@@ -34,8 +34,32 @@ class PagesBase:
         self.outbox.append(value)
 
 
+class SlicingBase:
+    pass
+
+
+class ExecutionResult:
+    @staticmethod
+    def success(message="", data=""):
+        return types.SimpleNamespace(status="success", message=message, data=data)
+
+    @staticmethod
+    def skipped(message=""):
+        return types.SimpleNamespace(status="skipped", message=message, data="")
+
+    @staticmethod
+    def failure(status, message, data=""):
+        return types.SimpleNamespace(status=status, message=message, data=data)
+
+
 orca = types.ModuleType("orca")
 orca.pages = types.SimpleNamespace(PagesPluginCapabilityBase=PagesBase)
+orca.slicing = types.SimpleNamespace(
+    SlicingPipelineCapabilityBase=SlicingBase,
+    Step=types.SimpleNamespace(psGCodePostProcess="postprocess"),
+)
+orca.ExecutionResult = ExecutionResult
+orca.PluginResult = types.SimpleNamespace(RecoverableError="recoverable")
 orca.base = type("Base", (), {})
 orca.plugin = lambda cls: cls
 orca.register_capability = mock.Mock()
@@ -95,7 +119,8 @@ class VisionPluginTests(unittest.TestCase):
         compile(PLUGIN_PATH.read_text(encoding="utf-8"), str(PLUGIN_PATH), "exec")
         package = plugin.AIPrintAssistantPlugin()
         package.register_capabilities()
-        orca.register_capability.assert_called_with(plugin.AIAssistantPage)
+        orca.register_capability.assert_any_call(plugin.AIAssistantPage)
+        orca.register_capability.assert_any_call(plugin.AIGCodeReviewCapability)
         page = plugin.AIAssistantPage()
         self.assertTrue(page.base_initialized)
 
@@ -237,6 +262,146 @@ class VisionPluginTests(unittest.TestCase):
         self.assertNotIn("vision-secret", json.dumps(public))
         self.assertTrue(public["has_text_key"])
         self.assertTrue(public["has_vision_key"])
+
+    def test_setting_changes_are_whitelisted_and_bounded(self):
+        parsed = plugin.normalize_result(json.dumps({
+            "answer": "Оптимизация",
+            "setting_changes": [
+                {"category": "process", "key": "outer_wall_speed", "value": 45},
+                {"category": "process", "key": "outer_wall_speed", "value": 1000},
+                {"category": "printer", "key": "printer_model", "value": "other"},
+                {"category": "printer", "key": "layer_height", "value": 0.2},
+            ],
+        }))
+        self.assertEqual(len(parsed["setting_changes"]), 1)
+        self.assertEqual(parsed["setting_changes"][0]["value"], "45")
+
+    def test_apply_changes_uses_orca_transactions(self):
+        transactions = []
+
+        class Transaction:
+            def __init__(self, category):
+                self.category = category
+                self.values = {}
+                self.target_name = category + " profile"
+
+            def set(self, key, value):
+                self.values[key] = value
+
+            def commit(self):
+                transactions.append(self)
+                return self
+
+        class Editor:
+            def __init__(self, category):
+                self.category = category
+                self.args = None
+
+            def begin_update(self, *args):
+                self.args = args
+                return Transaction(self.category)
+
+        editors = {name: Editor(name) for name in ("process", "filament", "printer")}
+        with mock.patch.object(plugin.orca.host, "preset", types.SimpleNamespace(**editors), create=True):
+            applied = plugin.apply_setting_changes([
+                {"category": "process", "key": "layer_height", "value": "0.2"},
+                {"category": "filament", "key": "fan_max_speed", "value": "90"},
+            ])
+        self.assertEqual(applied, ["process profile", "filament profile"])
+        self.assertEqual(editors["filament"].args, (1,))
+        self.assertEqual(transactions[1].values, {"fan_max_speed": "90"})
+
+    def test_gcode_summary_and_previous_analysis_are_reviewed(self):
+        summary = plugin.summarize_gcode(
+            ";LAYER_CHANGE\nG1 Z0.2 F1200\nM104 S210\nM106 S128\nG1 X10 E1.2 F1800\nM112\n"
+        )
+        self.assertEqual(summary["layer_markers"], 1)
+        self.assertEqual(summary["max_z_mm"], 0.2)
+        self.assertEqual(summary["temperatures_c"]["M104"], [210.0])
+        self.assertTrue(summary["alerts"])
+        with mock.patch.object(plugin, "request_chat", return_value=result()) as request:
+            reviewed = plugin.run_gcode_review(config(), summary, {"answer": "Нужно больше обдува"})
+        packet = request.call_args.args[1][-1]["content"]
+        self.assertIn("Нужно больше обдува", packet)
+        self.assertEqual(reviewed["setting_changes"], [])
+
+    def test_camera_snapshot_validation_and_decoding(self):
+        class CameraResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def read(self, limit):
+                return b"\xff\xd8\xffcamera"
+
+            def geturl(self):
+                return "http://printer.local/snapshot.jpg"
+
+        with mock.patch.object(plugin.urllib.request, "urlopen", return_value=CameraResponse()):
+            image = plugin.fetch_camera_snapshot("http://printer.local/snapshot.jpg")
+        self.assertTrue(image.startswith("data:image/jpeg;base64,"))
+        with self.assertRaises(ValueError):
+            plugin.validate_monitor_url("https://user:secret@example.test/snapshot")
+
+    def test_prepare_preview_dock_panel_is_created(self):
+        page = plugin.AIAssistantPage()
+        PagesBase.__init__(page)
+        dock = mock.Mock()
+        creator = mock.Mock(return_value=dock)
+        with mock.patch.object(plugin.orca.host, "ui",
+                               types.SimpleNamespace(create_dock_panel=creator), create=True):
+            page.on_load()
+        self.assertEqual(creator.call_args.kwargs["html"], plugin.DOCK_PAGE)
+        self.assertEqual(creator.call_args.kwargs["dock"], "right")
+        self.assertIn("dock_ready", plugin.DOCK_PAGE)
+
+    def test_pipeline_reviews_exported_gcode(self):
+        import tempfile
+        page = mock.Mock()
+        with tempfile.NamedTemporaryFile("w", suffix=".gcode", delete=False,
+                                         encoding="utf-8") as handle:
+            handle.write("G28\nG1 Z0.2 E1\n")
+            path = handle.name
+        try:
+            with mock.patch.object(plugin, "ACTIVE_PAGE", page):
+                outcome = plugin.AIGCodeReviewCapability().execute(types.SimpleNamespace(
+                    step=plugin.orca.slicing.Step.psGCodePostProcess, gcode_path=path,
+                ))
+        finally:
+            pathlib.Path(path).unlink()
+        self.assertEqual(outcome.status, "success")
+        self.assertEqual(page.review_gcode_summary.call_args.args[0]["lines"], 2)
+
+    def test_monitor_start_requires_snapshot_url(self):
+        page = plugin.AIAssistantPage()
+        PagesBase.__init__(page)
+        page.on_message({"type": "monitor_start"})
+        self.assertEqual(page.outbox[-1]["type"], "error")
+        self.assertIn("URL камеры", page.outbox[-1]["text"])
+
+    def test_monitoring_analyzes_camera_snapshot(self):
+        page = plugin.AIAssistantPage()
+        PagesBase.__init__(page)
+        stored = config()
+        stored.update({"monitor_url": "http://printer.local/snapshot", "monitor_interval": 30})
+        page._stored_config = json.dumps(stored)
+
+        def analyzed(*args, **kwargs):
+            stored["monitor_enabled"] = False
+            page._stored_config = json.dumps(stored)
+            return plugin.normalize_result(result())
+
+        with mock.patch.object(plugin, "fetch_camera_snapshot", return_value=IMAGE), \
+                mock.patch.object(plugin, "run_analysis", side_effect=analyzed):
+            page.on_message({"type": "monitor_start"})
+            deadline = time.time() + 2
+            while not any(item.get("type") == "monitor_answer" for item in page.outbox) \
+                    and time.time() < deadline:
+                time.sleep(0.01)
+        page._stop_monitor()
+        self.assertTrue(any(item.get("type") == "monitor_answer" for item in page.outbox))
 
     def test_stop_always_requires_confirmation(self):
         parsed = plugin.normalize_result(json.dumps({
