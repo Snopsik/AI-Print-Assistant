@@ -53,9 +53,11 @@ spec.loader.exec_module(plugin)
 def config(mode="separate"):
     return {
         "mode": mode,
+        "text_provider": "custom",
         "text_endpoint": "https://text.test/v1/chat/completions",
         "text_model": "logic-model",
         "text_api_key": "text-secret",
+        "vision_provider": "custom",
         "vision_endpoint": "https://vision.test/v1/chat/completions",
         "vision_model": "vision-model",
         "vision_api_key": "vision-secret",
@@ -103,6 +105,19 @@ class VisionPluginTests(unittest.TestCase):
             plugin.models_endpoint("https://host/v1/responses"),
             "https://host/v1/models",
         )
+
+    def test_provider_presets_and_custom_endpoint(self):
+        self.assertEqual(plugin.provider_for_endpoint(plugin.PROVIDER_ENDPOINTS["openai"]), "openai")
+        self.assertEqual(plugin.provider_for_endpoint(plugin.PROVIDER_ENDPOINTS["gemini"]), "gemini")
+        self.assertEqual(plugin.provider_for_endpoint(plugin.PROVIDER_ENDPOINTS["glm"]), "glm")
+        self.assertEqual(plugin.provider_for_endpoint(plugin.PROVIDER_ENDPOINTS["openrouter"]), "openrouter")
+        self.assertEqual(
+            plugin.provider_for_endpoint("https://my-server.example/v1/chat/completions"),
+            "custom",
+        )
+        self.assertIn("value=\"custom\">Свой endpoint</option>", plugin.PAGE)
+        self.assertIn("id=\"text_custom_endpoint\" hidden", plugin.PAGE)
+        self.assertIn("id=\"vision_custom_endpoint\" hidden", plugin.PAGE)
 
     def test_model_discovery_and_vision_tags(self):
         payload = {"data": [
