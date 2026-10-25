@@ -6,7 +6,7 @@
 # name = "AI Print Assistant"
 # description = "Cloud text and vision assistant with model discovery, collaborative image verification, print-risk guidance, and explicit user confirmation. Never controls the printer directly."
 # author = "Kimi"
-# version = "2.1.1"
+# version = "2.1.2"
 # ///
 
 import base64
@@ -142,7 +142,8 @@ def _vector(value):
 
 
 def collect_context():
-    context = {"orca_ui_language": orca.host.app_language()}
+    # app_language() is absent in early 2.5.0-alpha plugin APIs.
+    context = {"orca_ui_language": _attr(orca.host, "app_language", "ru_RU")}
     try:
         bundle = orca.host.preset_bundle()
         context["process_preset"] = _attr(bundle.current_process_preset(), "name", "")
@@ -203,6 +204,16 @@ def _error_message(payload, fallback):
     return text[:700] if text else fallback
 
 
+def normalize_chat_endpoint(endpoint):
+    """Accept either a service base URL or a full chat-completions URL."""
+    endpoint = str(endpoint).strip()
+    base, separator, query = endpoint.partition("?")
+    base = base.rstrip("/")
+    if not base.endswith(("/chat/completions", "/responses")):
+        base += "/chat/completions"
+    return base + (separator + query if separator else "")
+
+
 def validate_service(service):
     endpoint = str(service.get("endpoint", "")).strip()
     if not endpoint.lower().startswith("https://"):
@@ -233,7 +244,7 @@ def request_chat(service, messages, image_data=None):
         "messages": outgoing,
     }).encode("utf-8")
     request = urllib.request.Request(
-        str(service["endpoint"]).strip(),
+        normalize_chat_endpoint(service["endpoint"]),
         data=body,
         method="POST",
         headers={
@@ -527,7 +538,7 @@ PAGE = r'''<!doctype html>
 <dialog id="settingsDialog"><div class="form"><h2>Модели и подключения</h2><label>Режим<select id="mode"><option value="unified">Одна модель для текста и зрения</option><option value="separate">Раздельно: текстовая логика + зрение</option></select></label>
 <fieldset id="textFields"><legend>Текстовая / универсальная модель</legend><label>Провайдер<select id="text_provider"><option value="openai">OpenAI</option><option value="gemini">Google Gemini</option><option value="glm">GLM / Z.AI</option><option value="openrouter">OpenRouter</option><option value="custom">Свой endpoint</option></select></label><div id="text_custom_endpoint" hidden><label>Ссылка своего endpoint<input id="text_endpoint" spellcheck="false" placeholder="https://example.com/v1/chat/completions"></label></div><label>Модель</label><div class="grid2"><input id="text_model" list="text_model_list" spellcheck="false"><button class="iconbtn" id="discover_text">Найти модели</button></div><datalist id="text_model_list"></datalist><label>API-ключ<input id="text_api_key" type="password" autocomplete="off" placeholder="Пусто — сохранить прежний"></label><div class="hint" id="text_key_state"></div><label class="hint"><input type="checkbox" id="visionOnlyText" style="width:auto;display:inline"> показать только модели с определённым зрением</label><div class="models" id="text_models">Нажмите «Найти модели» после сохранения ключа.</div></fieldset>
 <fieldset id="visionFields"><legend>Зрительная модель</legend><label>Провайдер<select id="vision_provider"><option value="openai">OpenAI</option><option value="gemini">Google Gemini</option><option value="glm">GLM / Z.AI</option><option value="openrouter">OpenRouter</option><option value="custom">Свой endpoint</option></select></label><div id="vision_custom_endpoint" hidden><label>Ссылка своего endpoint<input id="vision_endpoint" spellcheck="false" placeholder="https://example.com/v1/chat/completions"></label></div><label>Модель</label><div class="grid2"><input id="vision_model" list="vision_model_list" spellcheck="false"><button class="iconbtn" id="discover_vision">Найти модели</button></div><datalist id="vision_model_list"></datalist><label>API-ключ<input id="vision_api_key" type="password" autocomplete="off" placeholder="Пусто — сохранить прежний"></label><div class="hint" id="vision_key_state"></div><label class="hint"><input type="checkbox" id="visionOnlyVision" style="width:auto;display:inline"> показать только модели с определённым зрением</label><div class="models" id="vision_models">Список не загружен.</div></fieldset>
-<div class="hint">Формат API: OpenAI-совместимый <b>/chat/completions</b>; список запрашивается через <b>/models</b>. Пометки зрения берутся из метаданных провайдера или известных названий и не гарантируют поддержку. Можно ввести модель вручную. Ключи хранятся локально без шифрования.</div><div id="status"></div><div class="formactions"><button class="iconbtn" id="forget">Удалить все ключи</button><button class="primary" id="save">Сохранить</button></div></div></dialog>
+<div class="hint">Формат API: OpenAI-совместимый <b>/chat/completions</b>; список запрашивается через <b>/models</b>. Можно ввести базовый адрес, например <b>https://example.com/v1</b>, — <b>/chat/completions</b> добавится автоматически. Пометки зрения берутся из метаданных провайдера или известных названий и не гарантируют поддержку. Можно ввести модель вручную. Ключи хранятся локально без шифрования.</div><div id="status"></div><div class="formactions"><button class="iconbtn" id="forget">Удалить все ключи</button><button class="primary" id="save">Сохранить</button></div></div></dialog>
 <script>
 const chat=document.getElementById('chat'),input=document.getElementById('input'),send=document.getElementById('send'),busy=document.getElementById('busy'),dialog=document.getElementById('settingsDialog');
 let waiting=false,attachment='',savedConfig={},modelCache={text:[],vision:[]};
