@@ -556,6 +556,8 @@ class VisionPluginTests(unittest.TestCase):
         api_panel = plugin.PAGE.split('id="apiSettings"', 1)[1]
         self.assertIn('id="textFields"', api_panel)
         self.assertIn('id="forget"', api_panel)
+        self.assertIn('id="closeSettings" aria-label="Закрыть настройки"', plugin.PAGE)
+        self.assertIn("getElementById('closeSettings').onclick=()=>dialog.close()", plugin.PAGE)
 
 
 if __name__ == "__main__":
